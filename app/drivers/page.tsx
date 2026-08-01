@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 
-type DriverStatus = 'Active' | 'On Leave' | 'Training';
+type DriverStatus = '稼働' | '休み' | '応援';
 
 type Driver = {
   id: number;
@@ -21,8 +21,8 @@ const drivers: Driver[] = [
     area: 'Central Tokyo',
     phone: '+81 90 1234 5678',
     vehicle: 'Toyota Prius',
-    status: 'Active',
-    rank: 'A+',
+    status: '稼働',
+    rank: 'S',
   },
   {
     id: 2,
@@ -30,7 +30,7 @@ const drivers: Driver[] = [
     area: 'Yokohama',
     phone: '+81 80 9876 5432',
     vehicle: 'Honda StepWGN',
-    status: 'Training',
+    status: '応援',
     rank: 'A',
   },
   {
@@ -39,7 +39,7 @@ const drivers: Driver[] = [
     area: 'Osaka',
     phone: '+81 70 5555 0101',
     vehicle: 'Nissan Note',
-    status: 'Active',
+    status: '稼働',
     rank: 'A',
   },
   {
@@ -48,22 +48,22 @@ const drivers: Driver[] = [
     area: 'Nagoya',
     phone: '+81 90 2222 3344',
     vehicle: 'Suzuki Swift',
-    status: 'On Leave',
-    rank: 'B+',
+    status: '休み',
+    rank: 'B',
   },
 ];
 
 const sidebarItems = [
-  'Dashboard',
-  'Drivers',
-  'Deliveries',
-  'Shifts',
-  'Fuel',
-  'Sales',
+  'ダッシュボード',
+  'ドライバー',
+  '車両',
+  '配達',
+  'シフト',
+  '売上',
   'KPI',
-  'Support',
-  'Claims',
-  'Settings',
+  'サポート',
+  'クレーム',
+  '設定',
 ];
 
 export default function DriversPage() {
@@ -92,7 +92,7 @@ export default function DriversPage() {
 
           <nav className="space-y-2">
             {sidebarItems.map((item, index) => {
-              const isActive = item === 'Drivers';
+              const isActive = item === 'ドライバー';
               return (
                 <button
                   key={item}
@@ -116,13 +116,13 @@ export default function DriversPage() {
             <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-sm font-medium text-blue-600">Fleet Operations</p>
-                <h2 className="mt-1 text-2xl font-semibold text-slate-900">Driver Management</h2>
+                <h2 className="mt-1 text-2xl font-semibold text-slate-900">ドライバー一覧</h2>
               </div>
               <button
                 type="button"
                 className="rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
               >
-                + Add Driver
+                + ドライバー追加
               </button>
             </div>
 
@@ -132,12 +132,12 @@ export default function DriversPage() {
                   type="text"
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search drivers"
+                  placeholder="検索"
                   className="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm outline-none ring-0 transition focus:border-blue-400 focus:bg-white"
                 />
               </div>
               <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
-                4 drivers available
+                4名のドライバーが登録されています
               </div>
             </div>
 
@@ -145,13 +145,13 @@ export default function DriversPage() {
               <table className="min-w-full text-left text-sm">
                 <thead>
                   <tr className="border-b border-slate-200 text-slate-500">
-                    <th className="px-3 py-3 font-semibold">Name</th>
-                    <th className="px-3 py-3 font-semibold">Area</th>
-                    <th className="px-3 py-3 font-semibold">Phone</th>
-                    <th className="px-3 py-3 font-semibold">Vehicle</th>
-                    <th className="px-3 py-3 font-semibold">Status</th>
-                    <th className="px-3 py-3 font-semibold">KPI Rank</th>
-                    <th className="px-3 py-3 font-semibold">Actions</th>
+                    <th className="px-3 py-3 font-semibold">名前</th>
+                    <th className="px-3 py-3 font-semibold">担当エリア</th>
+                    <th className="px-3 py-3 font-semibold">電話番号</th>
+                    <th className="px-3 py-3 font-semibold">車両</th>
+                    <th className="px-3 py-3 font-semibold">ステータス</th>
+                    <th className="px-3 py-3 font-semibold">KPIランク</th>
+                    <th className="px-3 py-3 font-semibold">操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -164,9 +164,9 @@ export default function DriversPage() {
                       <td className="px-3 py-4">
                         <span
                           className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
-                            driver.status === 'Active'
+                            driver.status === '稼働'
                               ? 'bg-emerald-100 text-emerald-700'
-                              : driver.status === 'Training'
+                              : driver.status === '応援'
                                 ? 'bg-amber-100 text-amber-700'
                                 : 'bg-slate-100 text-slate-600'
                           }`}
@@ -181,13 +181,13 @@ export default function DriversPage() {
                             type="button"
                             className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
                           >
-                            Edit
+                            編集
                           </button>
                           <button
                             type="button"
                             className="rounded-lg border border-rose-200 px-3 py-1.5 text-xs font-semibold text-rose-600 transition hover:bg-rose-50"
                           >
-                            Delete
+                            削除
                           </button>
                         </div>
                       </td>
