@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 export default function Home() {
   return (
     <main className="min-h-screen bg-gray-100 p-8">
@@ -15,10 +17,10 @@ export default function Home() {
           <p className="mt-2">20台登録</p>
         </div>
 
-        <div className="bg-white rounded-xl shadow p-6">
+        <Link href="/drivers" className="block rounded-xl bg-white p-6 shadow transition hover:shadow-md">
           <h2 className="text-xl font-bold">👤 ドライバー</h2>
           <p className="mt-2">18名登録</p>
-        </div>
+        </Link>
 
         <div className="bg-white rounded-xl shadow p-6">
           <h2 className="text-xl font-bold">🔔 通知</h2>

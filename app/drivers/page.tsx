@@ -116,7 +116,7 @@ export default function DriversPage() {
             <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-sm font-medium text-blue-600">Fleet Operations</p>
-                <h2 className="mt-1 text-2xl font-semibold text-slate-900">ドライバー一覧</h2>
+                <h2 className="mt-1 text-2xl font-semibold text-slate-900">ドライバー管理</h2>
               </div>
               <button
                 type="button"
