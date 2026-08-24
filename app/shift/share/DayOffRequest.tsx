@@ -31,6 +31,9 @@ export default function DayOffRequest() {
   const [verified, setVerified] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [showPinChange, setShowPinChange] = useState(false);
+const [newPinCode, setNewPinCode] = useState("");
+const [confirmNewPinCode, setConfirmNewPinCode] = useState("");
 
   useEffect(() => {
     const loadDrivers = async () => {
@@ -176,7 +179,47 @@ export default function DayOffRequest() {
 
     setMessage("希望休を登録しました。");
   };
+  const changePin = async () => {
+    if (!verified) {
+      setMessage("先に現在のPINで本人確認してください。");
+      return;
+    }
 
+    if (!/^\d{4}$/.test(newPinCode)) {
+      setMessage("新しいPINは4桁の数字で入力してください。");
+      return;
+    }
+
+    if (newPinCode !== confirmNewPinCode) {
+      setMessage("新しいPINが一致していません。");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("");
+
+    const { error } = await supabase.rpc(
+      "change_shift_driver_pin",
+      {
+        p_driver_name: driverName,
+        p_current_pin: pinCode,
+        p_new_pin: newPinCode,
+      }
+    );
+
+    setBusy(false);
+
+    if (error) {
+      setMessage(`PIN変更エラー：${error.message}`);
+      return;
+    }
+
+    setPinCode(newPinCode);
+    setNewPinCode("");
+    setConfirmNewPinCode("");
+    setShowPinChange(false);
+    setMessage("PINを変更しました。次回から新しいPINを使用してください。");
+  };
   return (
     <section className="mx-auto mt-6 max-w-3xl rounded-2xl border bg-white p-4 shadow-sm sm:p-6">
       <h2 className="text-xl font-bold">希望休の申請</h2>
@@ -326,6 +369,58 @@ export default function DayOffRequest() {
           >
             {busy ? "登録中..." : "この内容で希望休を登録"}
           </button>
+                    <div className="mt-6 border-t pt-5">
+            <button
+              type="button"
+              onClick={() => setShowPinChange((current) => !current)}
+              className="w-full rounded-lg border border-blue-600 px-4 py-3 font-bold text-blue-700"
+            >
+              {showPinChange ? "PIN変更を閉じる" : "自分のPINを変更する"}
+            </button>
+
+            {showPinChange && (
+              <div className="mt-4 rounded-xl bg-blue-50 p-4">
+                <p className="font-bold">新しい4桁PIN</p>
+
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={4}
+                  value={newPinCode}
+                  onChange={(event) =>
+                    setNewPinCode(
+                      event.target.value.replace(/\D/g, "")
+                    )
+                  }
+                  placeholder="新しいPIN"
+                  className="mt-3 w-full rounded-lg border bg-white px-3 py-3 text-center text-lg tracking-widest"
+                />
+
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={4}
+                  value={confirmNewPinCode}
+                  onChange={(event) =>
+                    setConfirmNewPinCode(
+                      event.target.value.replace(/\D/g, "")
+                    )
+                  }
+                  placeholder="新しいPINをもう一度"
+                  className="mt-3 w-full rounded-lg border bg-white px-3 py-3 text-center text-lg tracking-widest"
+                />
+
+                <button
+                  type="button"
+                  onClick={changePin}
+                  disabled={busy}
+                  className="mt-3 w-full rounded-lg bg-blue-600 px-4 py-3 font-bold text-white disabled:opacity-50"
+                >
+                  {busy ? "変更中..." : "新しいPINへ変更"}
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </section>
