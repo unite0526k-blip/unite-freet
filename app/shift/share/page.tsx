@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { supabase as maybeSupabase } from "../../../lib/supabase";
+import DayOffRequest from "./DayOffRequest";
 
 const supabase = maybeSupabase!;
 
@@ -588,7 +589,7 @@ export default function ShiftSharePage() {
             </details>
           </section>
         )}
-
+<DayOffRequest />
         <p className="mt-6 text-right text-xs text-slate-500">
           最終更新：2026年8月14日
         </p>
