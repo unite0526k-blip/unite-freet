@@ -2,6 +2,9 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { supabase as maybeSupabase } from "../lib/supabase";
+
+const supabase = maybeSupabase!;
 
 const VEHICLES_STORAGE_KEY = "unite-fleet-vehicles";
 const DRIVERS_STORAGE_KEY = "unite-fleet-drivers";
@@ -25,8 +28,39 @@ export default function Home() {
   const [driverCount, setDriverCount] = useState(0);
 
   useEffect(() => {
-    setVehicleCount(getSavedCount(VEHICLES_STORAGE_KEY));
-    setDriverCount(getSavedCount(DRIVERS_STORAGE_KEY));
+    const loadCounts = async () => {
+      // まず端末内のデータを表示
+      setVehicleCount(getSavedCount(VEHICLES_STORAGE_KEY));
+      setDriverCount(getSavedCount(DRIVERS_STORAGE_KEY));
+
+      // ドライバー数はクラウドのマスターを正として取得
+      try {
+        const { data, error } = await supabase
+          .from("fleet_master")
+          .select("drivers")
+          .eq("id", "default")
+          .maybeSingle();
+
+        if (!error && data && Array.isArray(data.drivers)) {
+          // 退職者を除いた現在のドライバー数
+          const activeDrivers = data.drivers.filter(
+            (driver: any) => driver?.status !== "退職"
+          );
+
+          setDriverCount(activeDrivers.length);
+
+          // この端末にも同期
+          localStorage.setItem(
+            DRIVERS_STORAGE_KEY,
+            JSON.stringify(data.drivers)
+          );
+        }
+      } catch (error) {
+        console.error("ドライバー数の取得に失敗しました", error);
+      }
+    };
+
+    void loadCounts();
   }, []);
 
   return (
