@@ -146,6 +146,11 @@ export default function ShiftSharePage() {
   const [shiftsByDate, setShiftsByDate] = useState<ShiftsByDate>({});
   const [cloudLoading, setCloudLoading] = useState(true);
   const [cloudMessage, setCloudMessage] = useState("");
+  const [currentPin, setCurrentPin] = useState("");
+  const [newPin, setNewPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const [pinMessage, setPinMessage] = useState("");
+  const [pinChanging, setPinChanging] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -280,6 +285,78 @@ export default function ShiftSharePage() {
   const changeOffice = (value: OfficeName) => {
     setOffice(value);
     setDriverName(OFFICE_DATA[value].drivers[0].name);
+    setCurrentPin("");
+    setNewPin("");
+    setConfirmPin("");
+    setPinMessage("");
+  };
+
+  const changeSelectedDriver = (value: string) => {
+    setDriverName(value);
+    setCurrentPin("");
+    setNewPin("");
+    setConfirmPin("");
+    setPinMessage("");
+  };
+
+  const changePin = async () => {
+    setPinMessage("");
+
+    if (!/^\d{4}$/.test(currentPin)) {
+      setPinMessage("現在のPINを4桁の数字で入力してください。");
+      return;
+    }
+    if (!/^\d{4}$/.test(newPin)) {
+      setPinMessage("新しいPINを4桁の数字で入力してください。");
+      return;
+    }
+    if (newPin !== confirmPin) {
+      setPinMessage("新しいPINが一致していません。");
+      return;
+    }
+    if (currentPin === newPin) {
+      setPinMessage("現在と異なるPINを入力してください。");
+      return;
+    }
+
+    setPinChanging(true);
+    const { data: setting, error } = await supabase
+      .from("shift_driver_settings")
+      .select("id,pin_code")
+      .eq("driver_name", selectedDriver.name)
+      .maybeSingle();
+
+    if (error) {
+      setPinMessage(`PIN確認エラー：${error.message}`);
+      setPinChanging(false);
+      return;
+    }
+
+    if (!setting || String(setting.pin_code) !== currentPin) {
+      setPinMessage("現在のPINが違います。");
+      setPinChanging(false);
+      return;
+    }
+
+    const { error: updateError } = await supabase
+      .from("shift_driver_settings")
+      .update({
+        pin_code: newPin,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", setting.id);
+
+    if (updateError) {
+      setPinMessage(`PIN変更エラー：${updateError.message}`);
+      setPinChanging(false);
+      return;
+    }
+
+    setCurrentPin("");
+    setNewPin("");
+    setConfirmPin("");
+    setPinMessage("PINを変更しました。");
+    setPinChanging(false);
   };
 
   return (
@@ -333,7 +410,7 @@ export default function ShiftSharePage() {
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <select
               value={selectedDriver.name}
-              onChange={(event) => setDriverName(event.target.value)}
+              onChange={(event) => changeSelectedDriver(event.target.value)}
               className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xl font-bold text-blue-950"
             >
               {displayDrivers.map((driver) => (
@@ -362,6 +439,65 @@ export default function ShiftSharePage() {
             </div>
           </div>
         </section>
+
+        <details className="mt-5 rounded-2xl border border-blue-200 bg-blue-50 p-5">
+          <summary className="cursor-pointer font-bold text-blue-950">
+            🔐 自分の4桁PINを変更
+          </summary>
+          <p className="mt-2 text-sm text-slate-600">
+            {selectedDriver.name}さんの現在のPINを確認して変更します。
+          </p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={4}
+              value={currentPin}
+              onChange={(event) =>
+                setCurrentPin(event.target.value.replace(/\D/g, ""))
+              }
+              placeholder="現在のPIN"
+              className="rounded-xl border border-slate-300 bg-white px-4 py-3"
+            />
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={4}
+              value={newPin}
+              onChange={(event) =>
+                setNewPin(event.target.value.replace(/\D/g, ""))
+              }
+              placeholder="新しいPIN"
+              className="rounded-xl border border-slate-300 bg-white px-4 py-3"
+            />
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={4}
+              value={confirmPin}
+              onChange={(event) =>
+                setConfirmPin(event.target.value.replace(/\D/g, ""))
+              }
+              placeholder="新しいPINを再入力"
+              className="rounded-xl border border-slate-300 bg-white px-4 py-3"
+            />
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              disabled={pinChanging}
+              onClick={changePin}
+              className="rounded-xl bg-blue-600 px-5 py-3 font-bold text-white disabled:opacity-50"
+            >
+              {pinChanging ? "変更中…" : "PINを変更"}
+            </button>
+            {pinMessage && (
+              <p className="text-sm font-semibold text-blue-900">
+                {pinMessage}
+              </p>
+            )}
+          </div>
+        </details>
 
         <div className="mt-6 grid grid-cols-2 border-b border-slate-200">
           <button
@@ -589,7 +725,7 @@ export default function ShiftSharePage() {
             </details>
           </section>
         )}
-<DayOffRequest />
+        <DayOffRequest />
         <p className="mt-6 text-right text-xs text-slate-500">
           最終更新：2026年8月14日
         </p>

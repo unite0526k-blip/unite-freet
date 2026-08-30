@@ -5,16 +5,28 @@ import { supabase as maybeSupabase } from "../../lib/supabase";
 
 const supabase = maybeSupabase!;
 
+type CoursePriority = {
+  office: string;
+  course: string;
+};
+
 type DriverSetting = {
-  id: string;
+  id?: string;
   driver_name: string;
   office: string;
   pin_code: string;
   fixed_days_off: string[];
   available_courses: string[];
+  course_priorities: CoursePriority[];
   auto_assign: boolean;
 };
 
+type MasterDriver = {
+  name: string;
+  office: string;
+  subOffice?: string;
+  subOffices?: string[];
+};
 const WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"];
 
 const OFFICE_COURSES: Record<string, string[]> = {
@@ -30,17 +42,20 @@ export default function SettingsPage() {
   const [drivers, setDrivers] = useState<DriverSetting[]>([]);
   const [limits, setLimits] = useState<Record<string, number>>({});
   const [targetMonth, setTargetMonth] = useState(
-    new Date().toISOString().slice(0, 7)
+    new Date().toISOString().slice(0, 7),
   );
   const [loading, setLoading] = useState(true);
   const [selectedOffice, setSelectedOffice] = useState("松阪営業所");
   const [message, setMessage] = useState("");
+  const [masterDrivers, setMasterDrivers] = useState<MasterDriver[]>([]);
+  const [courseOfficeByDriver, setCourseOfficeByDriver] =
+    useState<Record<string, string>>({});
 
   const loadSettings = async () => {
     setLoading(true);
     setMessage("");
 
-    const [driverResult, limitResult] = await Promise.all([
+    const [driverResult, limitResult, masterResult] = await Promise.all([
       supabase
         .from("shift_driver_settings")
         .select("*")
@@ -51,10 +66,22 @@ export default function SettingsPage() {
         .from("shift_monthly_limits")
         .select("driver_name, day_limit")
         .eq("target_month", targetMonth),
+
+      supabase
+        .from("fleet_master")
+        .select("drivers")
+        .eq("id", "default")
+        .maybeSingle(),
     ]);
 
     if (driverResult.error) {
       setMessage(`読込エラー：${driverResult.error.message}`);
+      setLoading(false);
+      return;
+    }
+
+    if (masterResult.error) {
+      setMessage(`ドライバー管理の読込エラー：${masterResult.error.message}`);
       setLoading(false);
       return;
     }
@@ -65,7 +92,52 @@ export default function SettingsPage() {
       monthlyLimits[item.driver_name] = item.day_limit;
     }
 
-    setDrivers((driverResult.data ?? []) as DriverSetting[]);
+    const normalizeName = (value: string) => value.replace(/[\s　]/g, "");
+    const nextMasterDrivers =
+      ((masterResult.data?.drivers ?? []) as MasterDriver[]).map((driver) => ({
+        ...driver,
+        subOffices: Array.from(
+          new Set([
+            ...(driver.subOffices ?? []),
+            ...(driver.subOffice ? [driver.subOffice] : []),
+          ]),
+        ).filter((office) => office && office !== driver.office),
+      }));
+
+    const settingsByName = new Map(
+      ((driverResult.data ?? []) as DriverSetting[]).map((setting) => [
+        normalizeName(setting.driver_name),
+        setting,
+      ]),
+    );
+
+    // 表示するドライバーは fleet_master（ドライバー管理）にいる人だけ。
+    const synchronizedDrivers: DriverSetting[] = nextMasterDrivers
+      .filter((master) => master.name?.trim())
+      .map((master) => {
+        const existing = settingsByName.get(normalizeName(master.name));
+        return {
+          id: existing?.id,
+          driver_name: master.name,
+          office: master.office,
+          pin_code: existing?.pin_code ?? "0000",
+          fixed_days_off: existing?.fixed_days_off ?? [],
+          available_courses: existing?.available_courses ?? [],
+          course_priorities: existing?.course_priorities ?? [],
+          auto_assign: existing?.auto_assign ?? true,
+        };
+      });
+
+    setMasterDrivers(nextMasterDrivers);
+    setDrivers(synchronizedDrivers);
+    setCourseOfficeByDriver((current) => {
+      const next = { ...current };
+      for (const driver of synchronizedDrivers) {
+        const key = driver.id ?? driver.driver_name;
+        if (!next[key]) next[key] = driver.office;
+      }
+      return next;
+    });
     setLimits(monthlyLimits);
     setLoading(false);
   };
@@ -75,13 +147,15 @@ export default function SettingsPage() {
   }, [targetMonth]);
 
   const updateDriver = (
-    id: string,
-    changes: Partial<DriverSetting>
+    driverKey: string,
+    changes: Partial<DriverSetting>,
   ) => {
     setDrivers((current) =>
       current.map((driver) =>
-        driver.id === id ? { ...driver, ...changes } : driver
-      )
+        (driver.id ?? driver.driver_name) === driverKey
+          ? { ...driver, ...changes }
+          : driver,
+      ),
     );
   };
 
@@ -91,16 +165,59 @@ export default function SettingsPage() {
       ? current.filter((item) => item !== day)
       : [...current, day];
 
-    updateDriver(driver.id, { fixed_days_off: next });
+    updateDriver(driver.id ?? driver.driver_name, { fixed_days_off: next });
   };
 
-  const toggleCourse = (driver: DriverSetting, course: string) => {
-    const current = driver.available_courses ?? [];
-    const next = current.includes(course)
-      ? current.filter((item) => item !== course)
-      : [...current, course];
+  const courseKey = (office: string, course: string) =>
+    `${office}|||${course}`;
 
-    updateDriver(driver.id, { available_courses: next });
+  const hasAvailableCourse = (
+    driver: DriverSetting,
+    office: string,
+    course: string,
+  ) => {
+    const current = driver.available_courses ?? [];
+    return (
+      current.includes(courseKey(office, course)) ||
+      (office === driver.office && current.includes(course))
+    );
+  };
+
+  const toggleCourse = (
+    driver: DriverSetting,
+    office: string,
+    course: string,
+  ) => {
+    const current = driver.available_courses ?? [];
+    const qualified = courseKey(office, course);
+    const legacySelected =
+      office === driver.office && current.includes(course);
+    const selected = current.includes(qualified) || legacySelected;
+
+    let next = current.filter(
+      (item) => item !== qualified && !(legacySelected && item === course),
+    );
+    if (!selected) next = [...next, qualified];
+
+    updateDriver(driver.id ?? driver.driver_name, { available_courses: next });
+  };
+
+  const getRegisteredOffices = (driver: DriverSetting) => {
+    const normalizeName = (value: string) => value.replace(/[\s　]/g, "");
+    const master = masterDrivers.find(
+      (item) =>
+        normalizeName(item.name) === normalizeName(driver.driver_name),
+    );
+
+    const mainOffice = master?.office ?? driver.office;
+    const subOffices = Array.from(
+      new Set([
+        ...(master?.subOffices ?? []),
+        ...(master?.subOffice ? [master.subOffice] : []),
+      ]),
+    ).filter((office) => office && office !== mainOffice);
+
+    return [mainOffice, ...subOffices];
   };
 
   const saveDriver = async (driver: DriverSetting) => {
@@ -111,18 +228,35 @@ export default function SettingsPage() {
       return;
     }
 
-    const { error } = await supabase
-      .from("shift_driver_settings")
-      .update({
-        driver_name: driver.driver_name,
-office: driver.office,
-        pin_code: driver.pin_code,
-        fixed_days_off: driver.fixed_days_off ?? [],
-        available_courses: driver.available_courses ?? [],
-        auto_assign: driver.auto_assign,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", driver.id);
+    const payload = {
+      driver_name: driver.driver_name,
+      office: driver.office,
+      pin_code: driver.pin_code,
+      fixed_days_off: driver.fixed_days_off ?? [],
+      available_courses: driver.available_courses ?? [],
+      course_priorities: driver.course_priorities ?? [],
+      auto_assign: driver.auto_assign,
+      updated_at: new Date().toISOString(),
+    };
+
+    const saveResult = driver.id
+      ? await supabase
+          .from("shift_driver_settings")
+          .update(payload)
+          .eq("id", driver.id)
+          .select("id")
+          .maybeSingle()
+      : await supabase
+          .from("shift_driver_settings")
+          .insert(payload)
+          .select("id")
+          .single();
+
+    const error = saveResult.error;
+
+    if (!error && !driver.id && saveResult.data?.id) {
+      updateDriver(driver.driver_name, { id: saveResult.data.id });
+    }
 
     if (error) {
       setMessage(`保存エラー：${error.message}`);
@@ -142,7 +276,7 @@ office: driver.office,
         },
         {
           onConflict: "driver_name,target_month",
-        }
+        },
       );
 
     if (limitError) {
@@ -152,68 +286,7 @@ office: driver.office,
 
     setMessage(`${driver.driver_name}の設定を保存しました。`);
   };
-  const addDriver = async () => {
-  const driverName = window.prompt("追加するドライバー名を入力してください。");
 
-  if (!driverName?.trim()) return;
-
-  const { error } = await supabase
-    .from("shift_driver_settings")
-    .insert({
-      driver_name: driverName.trim(),
-      office: selectedOffice,
-      pin_code: "0000",
-      fixed_days_off: [],
-      available_courses: [],
-      auto_assign: true,
-    });
-
-  if (error) {
-    setMessage(`追加エラー：${error.message}`);
-    return;
-  }
-
-  setMessage(`${driverName.trim()}を追加しました。仮PINは0000です。`);
-  await loadSettings();
-};
-
-const deleteDriver = async (driver: DriverSetting) => {
-  const confirmed = window.confirm(
-    `${driver.driver_name}を削除しますか？\n希望休などの設定も削除されます。`
-  );
-
-  if (!confirmed) return;
-
-  const [requestResult, limitResult, driverResult] = await Promise.all([
-    supabase
-      .from("shift_day_off_requests")
-      .delete()
-      .eq("driver_name", driver.driver_name),
-
-    supabase
-      .from("shift_monthly_limits")
-      .delete()
-      .eq("driver_name", driver.driver_name),
-
-    supabase
-      .from("shift_driver_settings")
-      .delete()
-      .eq("id", driver.id),
-  ]);
-
-  const error =
-    requestResult.error ||
-    limitResult.error ||
-    driverResult.error;
-
-  if (error) {
-    setMessage(`削除エラー：${error.message}`);
-    return;
-  }
-
-  setMessage(`${driver.driver_name}を削除しました。`);
-  await loadSettings();
-};
 
   if (loading) {
     return <p className="p-6">設定を読み込み中...</p>;
@@ -225,7 +298,7 @@ const deleteDriver = async (driver: DriverSetting) => {
         <h1 className="text-2xl font-bold">シフト設定</h1>
 
         <p className="mt-2 text-sm text-gray-600">
-          PIN・希望休上限・固定休・担当可能コース・自動振り分けを設定します。
+          ドライバーはドライバー管理から自動反映します。担当可能コースはこの設定画面を正本として保存し、シフト管理では確認専用で表示します。ここではPIN・希望休上限・固定休・担当可能コース・コース優先順位・自動振り分けを設定します。
         </p>
 
         <div className="mt-5 flex flex-wrap items-center gap-3">
@@ -243,235 +316,402 @@ const deleteDriver = async (driver: DriverSetting) => {
           </span>
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
-  {[
-    "松阪営業所",
-    "伊勢営業所",
-    "鈴鹿営業所",
-    "伊賀営業所",
-    "浜松営業所",
-    "京都営業所",
-  ].map((office) => (
-    <button
-      key={office}
-      type="button"
-      onClick={() => setSelectedOffice(office)}
-      className={`rounded px-4 py-2 font-bold ${
-        selectedOffice === office
-          ? "bg-blue-600 text-white"
-          : "border bg-white text-gray-700"
-      }`}
-    >
-      {office}
-    </button>
-  ))}
-</div>
-<button
-  type="button"
-  onClick={addDriver}
-  className="mt-4 rounded bg-green-600 px-5 py-2 font-bold text-white"
->
-  ＋ {selectedOffice}にドライバー追加
-</button>
+          {[
+            "松阪営業所",
+            "伊勢営業所",
+            "鈴鹿営業所",
+            "伊賀営業所",
+            "浜松営業所",
+            "京都営業所",
+          ].map((office) => (
+            <button
+              key={office}
+              type="button"
+              onClick={() => setSelectedOffice(office)}
+              className={`rounded px-4 py-2 font-bold ${
+                selectedOffice === office
+                  ? "bg-blue-600 text-white"
+                  : "border bg-white text-gray-700"
+              }`}
+            >
+              {office}
+            </button>
+          ))}
+        </div>
         {message && (
-          <p className="mt-4 rounded bg-yellow-100 p-3 text-sm">
-            {message}
-          </p>
+          <p className="mt-4 rounded bg-yellow-100 p-3 text-sm">{message}</p>
         )}
       </div>
 
       <div className="space-y-4">
-{drivers
-  .filter((driver) => driver.office === selectedOffice)
-  .map((driver) => {          const courses = OFFICE_COURSES[driver.office] ?? [];
+        {drivers
+          .filter((driver) => driver.office === selectedOffice)
+          .map((driver) => {
+            const registeredOffices = getRegisteredOffices(driver);
+            const courseOffice =
+              courseOfficeByDriver[driver.id ?? driver.driver_name] ??
+              registeredOffices[0] ??
+              driver.office;
+            const courses = OFFICE_COURSES[courseOffice] ?? [];
 
-          return (
-            <section
-              key={driver.id}
-              className="rounded-xl bg-white p-5 shadow"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap gap-3">
-  <div>
-    <label className="block text-xs font-bold text-gray-500">
-      ドライバー名
-    </label>
+            return (
+              <section
+                key={driver.id ?? driver.driver_name}
+                className="rounded-xl bg-white p-5 shadow"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-gray-500">
+                        ドライバー名
+                      </label>
 
-    <input
-      type="text"
-      value={driver.driver_name}
-      onChange={(event) =>
-        updateDriver(driver.id, {
-          driver_name: event.target.value,
-        })
-      }
-      className="mt-1 rounded border px-3 py-2 font-bold"
-    />
-  </div>
+                      <input
+                        type="text"
+                        value={driver.driver_name}
+                        onChange={(event) =>
+                          updateDriver(driver.id ?? driver.driver_name, {
+                            driver_name: event.target.value,
+                          })
+                        }
+                        className="mt-1 rounded border px-3 py-2 font-bold"
+                      />
+                    </div>
 
-  <div>
-    <label className="block text-xs font-bold text-gray-500">
-      所属営業所
-    </label>
+                    <div>
+                      <label className="block text-xs font-bold text-gray-500">
+                        所属営業所
+                      </label>
 
-    <select
-      value={driver.office}
-      onChange={(event) =>
-        updateDriver(driver.id, {
-          office: event.target.value,
-          available_courses: [],
-        })
-      }
-      className="mt-1 rounded border px-3 py-2"
-    >
-      <option value="松阪営業所">松阪営業所</option>
-      <option value="伊勢営業所">伊勢営業所</option>
-      <option value="鈴鹿営業所">鈴鹿営業所</option>
-      <option value="伊賀営業所">伊賀営業所</option>
-      <option value="浜松営業所">浜松営業所</option>
-      <option value="京都営業所">京都営業所</option>
-      <option value="営業所なし">営業所なし</option>
-    </select>
-  </div>
-</div>
-
-<div className="flex gap-2">
-  <button
-    type="button"
-    onClick={() => saveDriver(driver)}
-    className="rounded bg-blue-600 px-5 py-2 font-bold text-white"
-  >
-    保存
-  </button>
-
-  <button
-    type="button"
-    onClick={() => deleteDriver(driver)}
-    className="rounded bg-red-600 px-5 py-2 font-bold text-white"
-  >
-    削除
-  </button>
-</div>              </div>
-
-              <div className="mt-5 grid gap-5 md:grid-cols-2">
-                <div>
-                  <label className="block text-sm font-bold">
-                    4桁PIN
-                  </label>
-
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={4}
-                    value={driver.pin_code}
-                    onChange={(event) =>
-                      updateDriver(driver.id, {
-                        pin_code: event.target.value.replace(/\D/g, ""),
-                      })
-                    }
-                    className="mt-2 w-32 rounded border px-3 py-2 text-center text-lg tracking-widest"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold">
-                    {targetMonth}の希望休上限
-                  </label>
-
-                  <input
-                    type="number"
-                    min={0}
-                    max={31}
-                    value={limits[driver.driver_name] ?? 4}
-                    onChange={(event) =>
-                      setLimits((current) => ({
-                        ...current,
-                        [driver.driver_name]: Number(event.target.value),
-                      }))
-                    }
-                    className="mt-2 w-24 rounded border px-3 py-2 text-center"
-                  />
-
-                  <span className="ml-2 text-sm text-gray-500">日</span>
-                </div>
-              </div>
-
-              <div className="mt-5">
-                <p className="text-sm font-bold">固定休</p>
-
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {WEEKDAYS.map((day) => {
-                    const selected =
-                      driver.fixed_days_off?.includes(day);
-
-                    return (
-                      <button
-                        key={day}
-                        type="button"
-                        onClick={() => toggleFixedDay(driver, day)}
-                        className={`rounded border px-4 py-2 ${
-                          selected
-                            ? "border-red-600 bg-red-600 text-white"
-                            : "bg-white text-gray-700"
-                        }`}
+                      <select
+                        value={driver.office}
+                        disabled
+                        title="ドライバー管理のメイン営業所から自動反映されます"
+                        className="mt-1 rounded border bg-gray-100 px-3 py-2 text-gray-700 disabled:opacity-100"
                       >
-                        {day}
-                      </button>
-                    );
-                  })}
+                        <option value="松阪営業所">松阪営業所</option>
+                        <option value="伊勢営業所">伊勢営業所</option>
+                        <option value="鈴鹿営業所">鈴鹿営業所</option>
+                        <option value="伊賀営業所">伊賀営業所</option>
+                        <option value="浜松営業所">浜松営業所</option>
+                        <option value="京都営業所">京都営業所</option>
+                        <option value="営業所なし">営業所なし</option>
+                      </select>
+                      <p className="mt-1 text-xs text-gray-500">
+                        ドライバー管理のメイン営業所から自動反映
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => saveDriver(driver)}
+                      className="rounded bg-blue-600 px-5 py-2 font-bold text-white"
+                    >
+                      保存
+                    </button>
+                  </div>{" "}
                 </div>
-              </div>
 
-              <div className="mt-5">
-                <p className="text-sm font-bold">担当可能コース</p>
+                <div className="mt-5 grid gap-5 md:grid-cols-2">
+                  <div>
+                    <label className="block text-sm font-bold">4桁PIN</label>
 
-                {courses.length === 0 ? (
-                  <p className="mt-2 text-sm text-gray-500">
-                    この営業所のコースは後から設定できます。
-                  </p>
-                ) : (
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={4}
+                      value={driver.pin_code}
+                      onChange={(event) =>
+                        updateDriver(driver.id ?? driver.driver_name, {
+                          pin_code: event.target.value.replace(/\D/g, ""),
+                        })
+                      }
+                      className="mt-2 w-32 rounded border px-3 py-2 text-center text-lg tracking-widest"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-bold">
+                      {targetMonth}の希望休上限
+                    </label>
+
+                    <input
+                      type="number"
+                      min={0}
+                      max={31}
+                      value={limits[driver.driver_name] ?? 4}
+                      onChange={(event) =>
+                        setLimits((current) => ({
+                          ...current,
+                          [driver.driver_name]: Number(event.target.value),
+                        }))
+                      }
+                      className="mt-2 w-24 rounded border px-3 py-2 text-center"
+                    />
+
+                    <span className="ml-2 text-sm text-gray-500">日</span>
+                  </div>
+                </div>
+
+                <div className="mt-5">
+                  <p className="text-sm font-bold">固定休</p>
+
                   <div className="mt-2 flex flex-wrap gap-2">
-                    {courses.map((course) => {
-                      const selected =
-                        driver.available_courses?.includes(course);
+                    {WEEKDAYS.map((day) => {
+                      const selected = driver.fixed_days_off?.includes(day);
 
                       return (
                         <button
-                          key={course}
+                          key={day}
                           type="button"
-                          onClick={() => toggleCourse(driver, course)}
+                          onClick={() => toggleFixedDay(driver, day)}
                           className={`rounded border px-4 py-2 ${
                             selected
-                              ? "border-green-600 bg-green-600 text-white"
+                              ? "border-red-600 bg-red-600 text-white"
                               : "bg-white text-gray-700"
                           }`}
                         >
-                          {course}
+                          {day}
                         </button>
                       );
                     })}
                   </div>
-                )}
-              </div>
+                </div>
 
-              <label className="mt-5 flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  checked={driver.auto_assign}
-                  onChange={(event) =>
-                    updateDriver(driver.id, {
-                      auto_assign: event.target.checked,
-                    })
-                  }
-                  className="h-5 w-5"
-                />
+                <div className="mt-5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-bold">担当可能コース</p>
+                    <span className="rounded bg-green-100 px-2 py-1 text-xs font-bold text-green-800">
+                      この画面で設定・保存
+                    </span>
+                  </div>
 
-                <span className="font-bold">
-                  自動振り分けの対象にする
-                </span>
-              </label>
-            </section>
-          );
-        })}
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {registeredOffices.map((office, index) => (
+                      <button
+                        key={office}
+                        type="button"
+                        onClick={() =>
+                          setCourseOfficeByDriver((current) => ({
+                            ...current,
+                            [driver.id ?? driver.driver_name]: office,
+                          }))
+                        }
+                        className={`rounded border px-4 py-2 font-bold ${
+                          courseOffice === office
+                            ? "border-blue-600 bg-blue-600 text-white"
+                            : "bg-white text-gray-700"
+                        }`}
+                      >
+                        {office.replace("営業所", "")}
+                        {index === 0 ? "（メイン）" : "（サブ）"}
+                      </button>
+                    ))}
+                  </div>
+
+                  <p className="mt-2 text-xs text-gray-500">
+                    メイン営業所を先頭表示。サブ営業所はドライバー管理で登録した営業所だけ選択できます。
+                  </p>
+
+                  {courses.length === 0 ? (
+                    <p className="mt-3 text-sm text-gray-500">
+                      {courseOffice}のコースは後から設定できます。
+                    </p>
+                  ) : (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {courses.map((course) => {
+                        const selected = hasAvailableCourse(
+                          driver,
+                          courseOffice,
+                          course,
+                        );
+
+                        return (
+                          <button
+                            key={`${courseOffice}-${course}`}
+                            type="button"
+                            onClick={() =>
+                              toggleCourse(driver, courseOffice, course)
+                            }
+                            className={`rounded border px-4 py-2 ${
+                              selected
+                                ? "border-green-600 bg-green-600 text-white"
+                                : "bg-white text-gray-700"
+                            }`}
+                          >
+                            {course}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <div className="mt-5 rounded-lg border bg-gray-50 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-bold">コース優先順位</p>
+                      <p className="mt-1 text-xs text-gray-500">
+                        メイン営業所と登録済みサブ営業所のコースから選択できます。
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateDriver(driver.id ?? driver.driver_name, {
+                          course_priorities: [
+                            ...(driver.course_priorities ?? []),
+                            {
+                              office: registeredOffices[0] ?? driver.office,
+                              course:
+                                OFFICE_COURSES[
+                                  registeredOffices[0] ?? driver.office
+                                ]?.[0] ?? "",
+                            },
+                          ],
+                        })
+                      }
+                      className="rounded bg-green-600 px-4 py-2 text-sm font-bold text-white"
+                    >
+                      ＋ 優先コース追加
+                    </button>
+                  </div>
+
+                  <div className="mt-3 space-y-2">
+                    {(driver.course_priorities ?? []).map((priority, index) => (
+                      <div
+                        key={`${driver.id ?? driver.driver_name}-${index}`}
+                        className="flex flex-wrap items-center gap-2"
+                      >
+                        <span className="w-12 text-sm font-bold">
+                          {index + 1}番
+                        </span>
+
+                        <select
+                          value={`${priority.office}|||${priority.course}`}
+                          onChange={(event) => {
+                            const [office, course] =
+                              event.target.value.split("|||");
+                            const nextPriorities = [
+                              ...(driver.course_priorities ?? []),
+                            ];
+
+                            nextPriorities[index] = { office, course };
+
+                            updateDriver(driver.id ?? driver.driver_name, {
+                              course_priorities: nextPriorities,
+                            });
+                          }}
+                          className="min-w-56 rounded border bg-white px-3 py-2"
+                        >
+                          {registeredOffices.flatMap((office) =>
+                            (OFFICE_COURSES[office] ?? []).map((course) => (
+                              <option
+                                key={`${office}-${course}`}
+                                value={`${office}|||${course}`}
+                              >
+                                {office}・{course}
+                              </option>
+                            )),
+                          )}
+                        </select>
+
+                        <button
+                          type="button"
+                          disabled={index === 0}
+                          onClick={() => {
+                            const nextPriorities = [
+                              ...(driver.course_priorities ?? []),
+                            ];
+                            const [movedPriority] = nextPriorities.splice(
+                              index,
+                              1,
+                            );
+
+                            if (!movedPriority) return;
+
+                            nextPriorities.splice(index - 1, 0, movedPriority);
+
+                            updateDriver(driver.id ?? driver.driver_name, {
+                              course_priorities: nextPriorities,
+                            });
+                          }}
+                          className="rounded bg-gray-600 px-3 py-2 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          ↑
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={
+                            index ===
+                            (driver.course_priorities ?? []).length - 1
+                          }
+                          onClick={() => {
+                            const nextPriorities = [
+                              ...(driver.course_priorities ?? []),
+                            ];
+                            const [movedPriority] = nextPriorities.splice(
+                              index,
+                              1,
+                            );
+
+                            if (!movedPriority) return;
+
+                            nextPriorities.splice(index + 1, 0, movedPriority);
+
+                            updateDriver(driver.id ?? driver.driver_name, {
+                              course_priorities: nextPriorities,
+                            });
+                          }}
+                          className="rounded bg-gray-600 px-3 py-2 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          ↓
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateDriver(driver.id ?? driver.driver_name, {
+                              course_priorities: (
+                                driver.course_priorities ?? []
+                              ).filter(
+                                (_, priorityIndex) => priorityIndex !== index,
+                              ),
+                            })
+                          }
+                          className="rounded bg-red-600 px-3 py-2 text-sm font-bold text-white"
+                        >
+                          削除
+                        </button>
+                      </div>
+                    ))}
+
+                    {(driver.course_priorities ?? []).length === 0 && (
+                      <p className="text-sm text-gray-500">
+                        優先順位は未設定です。
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <label className="mt-5 flex items-center gap-3">
+                  <input
+                    type="checkbox"
+                    checked={driver.auto_assign}
+                    onChange={(event) =>
+                      updateDriver(driver.id ?? driver.driver_name, {
+                        auto_assign: event.target.checked,
+                      })
+                    }
+                    className="h-5 w-5"
+                  />
+
+                  <span className="font-bold">自動振り分けの対象にする</span>
+                </label>
+              </section>
+            );
+          })}
       </div>
     </div>
   );
