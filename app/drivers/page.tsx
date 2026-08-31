@@ -243,6 +243,72 @@ export default function DriversPage() {
 
     setLoaded(true);
   }, []);
+useEffect(() => {
+  const refreshCourseSettings = async () => {
+    // ① まずシフト管理が保存した最新localStorageを読む
+    try {
+      const savedCourses = localStorage.getItem(COURSE_SETTINGS_KEY);
+
+      if (savedCourses) {
+        const parsedCourses = JSON.parse(
+          savedCourses,
+        ) as StoredCourseSetting[];
+
+        if (Array.isArray(parsedCourses) && parsedCourses.length > 0) {
+          setCourseSettings(parsedCourses);
+        }
+      }
+    } catch {
+      // 壊れていても画面は止めない
+    }
+
+    // ② ログイン中ならクラウド側も確認
+    if (!session) return;
+
+    const { data, error } = await supabase
+      .from("fleet_master")
+      .select("course_settings")
+      .eq("id", "default")
+      .maybeSingle();
+
+    if (error || !data) return;
+
+    const cloudCourses = Array.isArray(data.course_settings)
+      ? (data.course_settings as StoredCourseSetting[])
+      : [];
+
+    if (cloudCourses.length > 0) {
+      setCourseSettings(cloudCourses);
+
+      localStorage.setItem(
+        COURSE_SETTINGS_KEY,
+        JSON.stringify(cloudCourses),
+      );
+    }
+  };
+
+  void refreshCourseSettings();
+
+  // シフト管理から戻ってきた時にも再読込
+  const handleFocus = () => {
+    void refreshCourseSettings();
+  };
+
+  // 別タブでシフト管理を変更した場合にも再読込
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key === COURSE_SETTINGS_KEY) {
+      void refreshCourseSettings();
+    }
+  };
+
+  window.addEventListener("focus", handleFocus);
+  window.addEventListener("storage", handleStorage);
+
+  return () => {
+    window.removeEventListener("focus", handleFocus);
+    window.removeEventListener("storage", handleStorage);
+  };
+}, [session]);
 
   useEffect(() => {
     if (!loaded) return;

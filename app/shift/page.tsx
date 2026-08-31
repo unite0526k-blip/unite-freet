@@ -162,9 +162,12 @@ const getCourseNamesForDate = (
   region: Region,
   preset: "normal" | "weekday",
 ) => {
-  if (preset === "normal") return NORMAL_COURSE_NAMES[region];
-
   const weekday = new Date(`${dateValue}T00:00:00`).getDay();
+
+  // 伊勢の日曜は常に神久＋朝熊を1人で担当する。
+  // 「通常版」を選んでいても、この固定条件だけは崩さない。
+
+  if (preset === "normal") return NORMAL_COURSE_NAMES[region];
 
   if (weekday === 0 && region === "松阪") {
     return [
@@ -382,15 +385,18 @@ export default function ShiftPage() {
   const [activeTab, setActiveTab] = useState<Region>("松阪");
   const [selectedWeek, setSelectedWeek] = useState(0);
   const [coursePreset, setCoursePreset] = useState<"normal" | "weekday">(
-    "normal",
+    "weekday",
   );
   const [selectedDate, setSelectedDate] = useState(() =>
     formatDateKey(new Date()),
   );
-  const [autoMonth, setAutoMonth] = useState(() =>
-    formatDateKey(new Date()).slice(0, 7),
-  );
-  const [requestedDaysOff, setRequestedDaysOff] = useState<RequestedDaysOff>(
+const [autoMonth, setAutoMonth] = useState(() =>
+  formatDateKey(new Date()).slice(0, 7),
+);
+
+useEffect(() => {
+  setAutoMonth(selectedDate.slice(0, 7));
+}, [selectedDate]);  const [requestedDaysOff, setRequestedDaysOff] = useState<RequestedDaysOff>(
     {},
   );
   const [fixedDaysOff, setFixedDaysOff] = useState<FixedDaysOff>({});
@@ -814,11 +820,36 @@ export default function ShiftPage() {
     saveData("unite-fleet-fixed-days-off", fixedDaysOff);
   }, [fixedDaysOff, localDataReady]);
 
-  useEffect(() => {
-    if (!localDataReady) return;
-    saveData("unite-fleet-course-settings", courseSettings);
-  }, [courseSettings, localDataReady]);
+useEffect(() => {
+  if (!localDataReady) return;
 
+  // ローカルへ保存
+  saveData("unite-fleet-course-settings", courseSettings);
+
+  // 管理者ログインしていなければローカル保存だけ
+  if (!session) return;
+
+  // Supabaseのfleet_masterにも自動反映
+  const syncCourseSettingsToCloud = async () => {
+    const { error } = await supabase
+      .from("fleet_master")
+      .update({
+        course_settings: courseSettings,
+        updated_by: session.user.id,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", "default");
+
+    if (error) {
+      console.error("コース設定の自動同期エラー:", error);
+      return;
+    }
+
+    console.log("コース設定をクラウドへ自動同期しました");
+  };
+
+  void syncCourseSettingsToCloud();
+}, [courseSettings, localDataReady, session]);
   const updateCourseSetting = (id: string, patch: Partial<CourseSetting>) => {
     setCourseSettings((previous) =>
       previous.map((setting) =>
@@ -827,29 +858,43 @@ export default function ShiftPage() {
     );
   };
 
-  const addCourseSetting = () => {
-    const name = newCourseName.trim();
-    if (!name) return alert("コース名を入力してください");
-    if (
-      courseSettings.some(
-        (setting) => setting.region === activeTab && setting.name === name,
-      )
-    ) {
-      return alert("同じコース名がすでにあります");
-    }
-    setCourseSettings((previous) => [
-      ...previous,
-      {
-        id: `${activeTab}-${Date.now()}`,
-        region: activeTab,
-        name,
-        closedWeekdays: [],
-        fixedDriver: "",
-      },
-    ]);
-    setNewCourseName("");
-  };
+const addCourseSetting = () => {
+  const name = newCourseName.trim();
 
+  if (!name) {
+    return alert("コース名を入力してください");
+  }
+
+  if (
+    courseSettings.some(
+      (setting) =>
+        setting.region === activeTab &&
+        setting.name === name,
+    )
+  ) {
+    return alert("同じコース名がすでにあります");
+  }
+
+  const nextCourseSettings: CourseSetting[] = [
+    ...courseSettings,
+    {
+      id: `${activeTab}-${Date.now()}`,
+      region: activeTab,
+      name,
+      closedWeekdays: [],
+      fixedDriver: "",
+    },
+  ];
+
+  setCourseSettings(nextCourseSettings);
+
+  saveData(
+    "unite-fleet-course-settings",
+    nextCourseSettings,
+  );
+
+  setNewCourseName("");
+};
   const deleteCourseSetting = (id: string) => {
     if (!confirm("このコース設定を削除しますか？")) return;
     setCourseSettings((previous) =>
@@ -1449,6 +1494,18 @@ if (priorityError) {
       ]),
     );
 
+    // 東 真規：月曜休み。火〜土は神久、日曜は神久・朝熊を原則出勤。
+    // 個別に登録された希望休は requestedOff() で最優先される。
+    uniqueDrivers.forEach((driver) => {
+      if (normalizeDriverName(driver.name) !== normalizeDriverName("東 真規")) return;
+      const condition = parsedConditions.get(driver.name);
+      if (!condition) return;
+      condition.weeklyDaysOff.add(1);
+      [0, 2, 3, 4, 5, 6].forEach((weekday) =>
+        condition.requiredWorkDays.add(weekday),
+      );
+    });
+
     const shouldBalanceDriver = (driver: DriverItem) => {
       if (
         driver.assignmentMode === "自動除外" ||
@@ -1582,7 +1639,7 @@ if (priorityError) {
                 return false;
             }
             if ((streaks.get(driver.name) ?? 0) >= 6) return false;
-            if (driver.name === "東 真規")
+            if (normalizeDriverName(driver.name) === normalizeDriverName("東 真規"))
               return (
                 weekday !== 1 &&
                 (course.course === "神久コース" ||
@@ -1608,6 +1665,49 @@ if (priorityError) {
           })
           .map((course) => {
             if (course.isLocked && course.driver) return course;
+
+            // 東 真規の固定条件は301・月間目標・候補採点より優先。
+            // 月曜と個別希望休だけ休み。それ以外は
+            // 火〜土＝神久、日曜＝神久・朝熊へ先に確定してロックする。
+            const eastDriver = uniqueDrivers.find(
+              (driver) =>
+                normalizeDriverName(driver.name) === normalizeDriverName("東 真規"),
+            );
+            const isEastFixedCourse =
+              region === "伊勢" &&
+              (course.course === "神久コース" ||
+                course.course === "神久・朝熊コース");
+            if (
+              eastDriver &&
+              isEastFixedCourse &&
+              weekday !== 1 &&
+              !requestedOff(eastDriver.name, day, weekday) &&
+              !assignedToday.has(eastDriver.name) &&
+              canDriverHandleCourse(eastDriver, region, course.course)
+            ) {
+              assignedToday.add(eastDriver.name);
+              workCounts.set(
+                eastDriver.name,
+                (workCounts.get(eastDriver.name) ?? 0) + 1,
+              );
+              regionalWorkCounts.set(
+                regionalCountKey(region, eastDriver.name),
+                (regionalWorkCounts.get(
+                  regionalCountKey(region, eastDriver.name),
+                ) ?? 0) + 1,
+              );
+              return {
+                ...course,
+                driver: eastDriver.name,
+                status: "配車済" as const,
+                memo:
+                  weekday === 0
+                    ? "固定条件：日曜 神久・朝熊"
+                    : "固定条件：神久",
+                isLocked: true,
+              };
+            }
+
             const courseSetting = courseSettings.find(
               (setting) =>
                 setting.region === region && setting.name === course.course,
@@ -1660,12 +1760,15 @@ if (priorityError) {
               }
               if ((streaks.get(driver.name) ?? 0) >= 6)
                 reasons.push("7連勤防止");
-              if (driver.name === "東 真規" && weekday === 1)
+              if (
+                normalizeDriverName(driver.name) === normalizeDriverName("東 真規") &&
+                weekday === 1
+              )
                 reasons.push("月曜固定休");
               if (driver.name === "中川 昭治" && weekday === 4)
                 reasons.push("木曜固定休");
               if (
-                driver.name === "東 真規" &&
+                normalizeDriverName(driver.name) === normalizeDriverName("東 真規") &&
                 course.course !== "神久コース" &&
                 course.course !== "神久・朝熊コース"
               )
@@ -1745,8 +1848,9 @@ if (priorityError) {
                     (courseSetting?.fixedDriver &&
                       normalizeDriverName(driver.name) ===
                         normalizeDriverName(courseSetting.fixedDriver)) ||
-                    (driver.name === "東 真規" &&
-                      course.course === "神久コース") ||
+                    (normalizeDriverName(driver.name) === normalizeDriverName("東 真規") &&
+                      (course.course === "神久コース" ||
+                        course.course === "神久・朝熊コース")) ||
                     (driver.name === "中川 昭治" && course.course === "Hコース")
                       ? -1000
                       : 0;
@@ -4195,11 +4299,19 @@ const monthlyCourseNames = Array.from(
                 </h2>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="date"
-                  value={selectedDate}
-                  onChange={(event) => setSelectedDate(event.target.value)}
-                  className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200"
+<input
+  type="date"
+  value={selectedDate}
+  onChange={(event) => {
+    const nextDate = event.target.value;
+
+    setSelectedDate(nextDate);
+    setAutoMonth(nextDate.slice(0, 7));
+    setSelectedWeek(
+      Math.floor((Number(nextDate.slice(8, 10)) - 1) / 7)
+    );
+  }}
+  className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200"
                 />
                 <div className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-slate-300">
                   {today}
