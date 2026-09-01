@@ -24,6 +24,37 @@ type SavedCourse = {
 };
 type ShiftsByDate = Record<string, Record<Region, SavedCourse[]>>;
 
+type PersonalAssignment = {
+  region: Region;
+  course: string;
+  status: SavedCourse["status"];
+};
+
+const REGIONS: Region[] = ["松阪", "伊勢", "伊賀"];
+
+function getPersonalAssignments(
+  driverName: string,
+  date: Date,
+  shiftsByDate: ShiftsByDate,
+): PersonalAssignment[] {
+  const dayData = shiftsByDate[dateKey(date)];
+  if (!dayData) return [];
+
+  return REGIONS.flatMap((region) =>
+    (dayData[region] ?? [])
+      .filter(
+        (course) =>
+          course.driver &&
+          normalizeName(course.driver) === normalizeName(driverName),
+      )
+      .map((course) => ({
+        region,
+        course: course.course,
+        status: course.status,
+      })),
+  );
+}
+
 const normalizeName = (value: string) => value.replace(/[\s　]/g, "");
 const dateKey = (date: Date) => {
   const year = date.getFullYear();
@@ -137,7 +168,12 @@ function getDayColor(weekday: number) {
 
 export default function ShiftSharePage() {
   const [office, setOffice] = useState<OfficeName>("松阪営業所");
-  const [month, setMonth] = useState("2026-08");
+const [month, setMonth] = useState(() => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+});
   const [driverName, setDriverName] = useState(
     OFFICE_DATA["松阪営業所"].drivers[0].name,
   );
@@ -230,10 +266,35 @@ export default function ShiftSharePage() {
     return Array.from(byName.values());
   }, [month, officeData.drivers, region, shiftsByDate]);
 
+  const allDrivers = useMemo(() => {
+    const byName = new Map<string, Driver>();
+
+    Object.values(OFFICE_DATA).forEach((data) => {
+      data.drivers.forEach((driver) => {
+        const key = normalizeName(driver.name);
+        if (!byName.has(key)) byName.set(key, driver);
+      });
+    });
+
+    Object.entries(shiftsByDate)
+      .filter(([date]) => date.startsWith(`${month}-`))
+      .forEach(([, regions]) => {
+        REGIONS.forEach((targetRegion) => {
+          (regions[targetRegion] ?? []).forEach((course) => {
+            if (!course.driver) return;
+            const key = normalizeName(course.driver);
+            if (!byName.has(key)) byName.set(key, { name: course.driver });
+          });
+        });
+      });
+
+    return Array.from(byName.values());
+  }, [month, shiftsByDate]);
+
   const selectedDriver =
-    displayDrivers.find(
+    allDrivers.find(
       (driver) => normalizeName(driver.name) === normalizeName(driverName),
-    ) ?? displayDrivers[0];
+    ) ?? allDrivers[0];
 
   const days = useMemo(() => {
     const lastDay = new Date(year, monthNumber, 0).getDate();
@@ -250,17 +311,51 @@ export default function ShiftSharePage() {
     });
   }, [year, monthNumber]);
 
-  const personalSchedule = days.map((item) => ({
-    ...item,
-    assignment: getAssignment(selectedDriver, item.date, region, shiftsByDate),
-  }));
+  const personalSchedule = days.map((item) => {
+    const assignments = getPersonalAssignments(
+      selectedDriver?.name ?? "",
+      item.date,
+      shiftsByDate,
+    );
+
+    return {
+      ...item,
+      assignments,
+      assignment:
+        assignments.length > 0
+          ? assignments
+              .map(
+                (entry) =>
+                  `${entry.region}・${entry.course.replace(/コース$/, "")}`,
+              )
+              .join(" / ")
+          : "休み",
+    };
+  });
 
   const workingDays = personalSchedule.filter(
-    (item) => item.assignment !== "休み" && item.assignment !== "未配置",
+    (item) => item.assignments.length > 0,
   ).length;
+
   const holidays = personalSchedule.filter(
-    (item) => item.assignment === "休み",
+    (item) => item.assignments.length === 0,
   ).length;
+
+  const workDaysByRegion = REGIONS.reduce<Record<Region, number>>(
+    (result, targetRegion) => {
+      result[targetRegion] = personalSchedule.filter((item) =>
+        item.assignments.some((entry) => entry.region === targetRegion),
+      ).length;
+      return result;
+    },
+    { 松阪: 0, 伊勢: 0, 伊賀: 0 },
+  );
+
+  const workBreakdown = REGIONS.filter(
+    (targetRegion) => workDaysByRegion[targetRegion] > 0,
+  )
+    .map((targetRegion) => `${targetRegion}${workDaysByRegion[targetRegion]}日`)
+    .join("・");
 
   const selectedDate = new Date(year, monthNumber - 1, selectedDay);
 
@@ -284,7 +379,6 @@ export default function ShiftSharePage() {
 
   const changeOffice = (value: OfficeName) => {
     setOffice(value);
-    setDriverName(OFFICE_DATA[value].drivers[0].name);
     setCurrentPin("");
     setNewPin("");
     setConfirmPin("");
@@ -405,7 +499,9 @@ export default function ShiftSharePage() {
         )}
 
         <section className="mt-6 rounded-3xl border border-blue-200 bg-blue-50 p-5 sm:p-7">
-          <p className="font-semibold text-blue-600">{office}</p>
+          <p className="font-semibold text-blue-600">
+            自分の予定（全営業所合算）
+          </p>
 
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <select
@@ -413,7 +509,7 @@ export default function ShiftSharePage() {
               onChange={(event) => changeSelectedDriver(event.target.value)}
               className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xl font-bold text-blue-950"
             >
-              {displayDrivers.map((driver) => (
+              {allDrivers.map((driver) => (
                 <option key={driver.name} value={driver.name}>
                   {driver.name}
                 </option>
@@ -428,6 +524,9 @@ export default function ShiftSharePage() {
               <p className="font-bold text-blue-600">今月の稼働</p>
               <p className="mt-1 text-4xl font-bold text-blue-950">
                 {workingDays}日
+              </p>
+              <p className="mt-2 text-sm font-semibold text-blue-700">
+                {workBreakdown || "今月の配置なし"}
               </p>
             </div>
 
@@ -579,42 +678,27 @@ export default function ShiftSharePage() {
 
                   <div className="border-t border-slate-200 bg-slate-50 p-4">
                     <h3 className="font-bold text-blue-950">
-                      この日の全コース配置
+                      この日の自分の配置
                     </h3>
 
                     <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                      {(shiftsByDate[dateKey(item.date)]?.[region]?.length
-                        ? shiftsByDate[dateKey(item.date)][region].map(
-                            (course) => course.course,
-                          )
-                        : officeData.courses
-                      ).map((course) => {
-                        const savedCourse = shiftsByDate[dateKey(item.date)]?.[
-                          region
-                        ]?.find((candidate) => candidate.course === course);
-
-                        return (
+                      {item.assignments.length > 0 ? (
+                        item.assignments.map((entry, index) => (
                           <div
-                            key={course}
-                            className={`flex items-center justify-between rounded-xl border px-4 py-3 ${
-                              savedCourse?.driver
-                                ? "border-emerald-200 bg-emerald-50"
-                                : "border-red-200 bg-red-50"
-                            }`}
+                            key={`${entry.region}-${entry.course}-${index}`}
+                            className="flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3"
                           >
-                            <span className="font-bold">{course}</span>
-                            <span
-                              className={
-                                savedCourse?.driver
-                                  ? "text-slate-700"
-                                  : "font-bold text-red-600"
-                              }
-                            >
-                              {savedCourse?.driver || "未配置"}
+                            <span className="font-bold">{entry.region}</span>
+                            <span className="font-semibold text-emerald-800">
+                              {entry.course}
                             </span>
                           </div>
-                        );
-                      })}
+                        ))
+                      ) : (
+                        <div className="rounded-xl border border-purple-200 bg-purple-50 px-4 py-3 font-bold text-purple-700">
+                          休み
+                        </div>
+                      )}
                     </div>
                   </div>
                 </details>
@@ -623,7 +707,7 @@ export default function ShiftSharePage() {
           </section>
         ) : (
           <section className="mt-6">
-            <h2 className="text-2xl font-bold text-blue-950">全員のシフト表</h2>
+            <h2 className="text-2xl font-bold text-blue-950">{office}・全員のシフト表</h2>
 
             <div className="mt-4 overflow-x-auto rounded-2xl border border-slate-200">
               <table className="min-w-[1150px] border-collapse bg-white">

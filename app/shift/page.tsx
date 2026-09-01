@@ -162,12 +162,9 @@ const getCourseNamesForDate = (
   region: Region,
   preset: "normal" | "weekday",
 ) => {
-  const weekday = new Date(`${dateValue}T00:00:00`).getDay();
-
-  // 伊勢の日曜は常に神久＋朝熊を1人で担当する。
-  // 「通常版」を選んでいても、この固定条件だけは崩さない。
-
   if (preset === "normal") return NORMAL_COURSE_NAMES[region];
+
+  const weekday = new Date(`${dateValue}T00:00:00`).getDay();
 
   if (weekday === 0 && region === "松阪") {
     return [
@@ -214,36 +211,57 @@ const resolveCourseNamesForDate = (
   return isOldAutomaticPattern ? presetNames : override;
 };
 
+const normalizeCourseName = (value: string) =>
+  String(value ?? "")
+    .trim()
+    .replace(/コース$/, "");
+
+const sameCourseName = (left: string, right: string) =>
+  normalizeCourseName(left) === normalizeCourseName(right);
+
+const uniqueCourseNames = (names: string[]) => {
+  const result: string[] = [];
+  for (const name of names) {
+    if (!result.some((current) => sameCourseName(current, name))) {
+      result.push(name);
+    }
+  }
+  return result;
+};
+
 const canDriveCourse = (
   supportedCourses: string[] | undefined,
   courseName: string,
 ) => {
-  // 担当可能コースが0件なら「何でも担当可能」ではなく「配置不可」。
-  // これが、サブ営業所を登録しただけの人がその営業所へ入っていた原因。
+  // 担当可能コースが0件なら配置不可。
   if (!supportedCourses?.length) return false;
 
-  const mergedCourse = courseName.match(/^([A-H]{2,})コース$/);
+  // 「G」と「Gコース」、「高町」と「高町コース」を同じコースとして判定する。
+  const normalizedSupported = new Set(
+    supportedCourses
+      .map((course) => normalizeCourseName(course))
+      .filter(Boolean),
+  );
+  const normalizedCourse = normalizeCourseName(courseName);
+
+  // AB / BC / CD などの統合コース。
+  const mergedCourse = normalizedCourse.match(/^([A-H]{2,})$/);
   if (mergedCourse) {
     return mergedCourse[1]
       .split("")
-      .every((letter) => supportedCourses.includes(`${letter}コース`));
+      .every((letter) => normalizedSupported.has(letter));
   }
 
-  if (courseName === "御薗・高向コース") {
-    return ["御薗コース", "高向コース"].every((name) =>
-      supportedCourses.includes(name),
-    );
+  if (normalizedCourse === "御薗・高向") {
+    return ["御薗", "高向"].every((name) => normalizedSupported.has(name));
   }
 
-  if (courseName === "神久・朝熊コース") {
-    return ["神久コース", "朝熊コース"].every((name) =>
-      supportedCourses.includes(name),
-    );
+  if (normalizedCourse === "神久・朝熊") {
+    return ["神久", "朝熊"].every((name) => normalizedSupported.has(name));
   }
 
-  return supportedCourses.includes(courseName);
+  return normalizedSupported.has(normalizedCourse);
 };
-
 const normalizeRegion = (office: string): Region | null => {
   const region = office.replace("営業所", "");
   return region === "松阪" || region === "伊勢" || region === "伊賀"
@@ -385,18 +403,15 @@ export default function ShiftPage() {
   const [activeTab, setActiveTab] = useState<Region>("松阪");
   const [selectedWeek, setSelectedWeek] = useState(0);
   const [coursePreset, setCoursePreset] = useState<"normal" | "weekday">(
-    "weekday",
+    "normal",
   );
   const [selectedDate, setSelectedDate] = useState(() =>
     formatDateKey(new Date()),
   );
-const [autoMonth, setAutoMonth] = useState(() =>
-  formatDateKey(new Date()).slice(0, 7),
-);
-
-useEffect(() => {
-  setAutoMonth(selectedDate.slice(0, 7));
-}, [selectedDate]);  const [requestedDaysOff, setRequestedDaysOff] = useState<RequestedDaysOff>(
+  const [autoMonth, setAutoMonth] = useState(() =>
+    formatDateKey(new Date()).slice(0, 7),
+  );
+  const [requestedDaysOff, setRequestedDaysOff] = useState<RequestedDaysOff>(
     {},
   );
   const [fixedDaysOff, setFixedDaysOff] = useState<FixedDaysOff>({});
@@ -426,10 +441,6 @@ useEffect(() => {
     Record<string, Region>
   >({});
 
-  // 月間シフト表のドライバー検索
-  // 入力したドライバーが入っているセルだけ金色で強調表示する。
-  const [shiftDriverSearch, setShiftDriverSearch] = useState("");
-
   useEffect(() => {
     const savedTargetWorkDays = loadData<Record<string, number | "">>(
       "unite-fleet-target-work-days",
@@ -443,34 +454,15 @@ useEffect(() => {
     saveData("unite-fleet-target-work-days", targetWorkDays);
   }, [localDataReady, targetWorkDays]);
 
-  // 301キーは氏名の空白差（例:「横溝一泰」「横溝 一泰」）で
-  // 別人扱いにならないよう、必ず正規化して扱う。
   const targetKey = (monthKey: string, region: Region, driverName: string) =>
-    `${monthKey}|${region}|${normalizeDriverName(driverName)}`;
+    `${monthKey}|${region}|${driverName}`;
 
   const getTargetWorkDays = (
     monthKey: string,
     region: Region,
     driverName: string,
   ) => {
-    const normalizedName = normalizeDriverName(driverName);
-    const normalizedKey = `${monthKey}|${region}|${normalizedName}`;
-
-    // 新形式
-    let value: number | "" | undefined = targetWorkDays[normalizedKey];
-
-    // 旧形式(localStorageに既に保存済み)も救済する。
-    // month|region|氏名 の氏名部分だけを正規化して一致させる。
-    if (value === undefined) {
-      const matchedEntry = Object.entries(targetWorkDays).find(([key]) => {
-        const [savedMonth, savedRegion, ...savedNameParts] = key.split("|");
-        if (savedMonth !== monthKey || savedRegion !== region) return false;
-        const savedName = savedNameParts.join("|");
-        return normalizeDriverName(savedName) === normalizedName;
-      });
-      value = matchedEntry?.[1];
-    }
-
+    const value = targetWorkDays[targetKey(monthKey, region, driverName)];
     return typeof value === "number" && Number.isFinite(value)
       ? Math.max(0, Math.floor(value))
       : undefined;
@@ -498,18 +490,12 @@ useEffect(() => {
     Array.from(
       new Map(
         standbyDrivers
-          .filter((driver) => {
-            // 301の対象者は「その営業所に名前が登録されている人」ではなく、
-            // 実際にその営業所で稼働できる人だけにする。
-            // メイン営業所の人は対象。
-            if (driver.mainArea === region) return true;
-
-            // サブ営業所は、担当可能コースが1つ以上登録されている人だけ対象。
-            // サブ営業所として登録されているだけでは対象にしない。
-            return getSupportedCoursesForRegion(driver, region).length > 0;
-          })
-          .filter((driver) => driver.assignmentMode !== "自動除外")
-          .map((driver) => [normalizeDriverName(driver.name), driver]),
+          .filter(
+            (driver) =>
+              driver.area.replace("営業所", "") === region ||
+              driver.mainArea === region,
+          )
+          .map((driver) => [driver.name, driver]),
       ).values(),
     );
 
@@ -637,18 +623,15 @@ useEffect(() => {
         const settingOffice = normalizeRegion(setting.office);
         const supportedCourses = (setting.available_courses ?? [])
           .filter((course) => !course.includes("|||"))
-          .map((course) =>
-            course.endsWith("コース") ? course : `${course}コース`,
-          );
+          .map((course) => normalizeCourseName(course))
+          .filter(Boolean);
 
         const qualifiedByOffice = (setting.available_courses ?? []).reduce(
           (acc, value) => {
             const [office, course] = String(value).split("|||");
             const region = normalizeRegion(office);
             if (!region || !course) return acc;
-            const normalizedCourse = course.endsWith("コース")
-              ? course
-              : `${course}コース`;
+            const normalizedCourse = normalizeCourseName(course);
             acc[region] = Array.from(
               new Set([...(acc[region] ?? []), normalizedCourse]),
             );
@@ -670,30 +653,9 @@ useEffect(() => {
             // 以前はメイン営業所と一致する行しか反映していなかったため、
             // 横溝・楠滝・徳田などの伊勢コース登録が生成側で空扱いになっていた。
             ...(settingOffice && supportedCourses.length > 0
-              ? {
-                  [settingOffice]: Array.from(
-                    new Set([
-                      ...(mergedDrivers[existingIndex].supportedCoursesByOffice?.[
-                        settingOffice
-                      ] ?? []),
-                      ...supportedCourses,
-                    ]),
-                  ),
-                }
+              ? { [settingOffice]: supportedCourses }
               : {}),
-            ...Object.fromEntries(
-              Object.entries(qualifiedByOffice).map(([region, courses]) => [
-                region,
-                Array.from(
-                  new Set([
-                    ...(mergedDrivers[existingIndex].supportedCoursesByOffice?.[
-                      region as Region
-                    ] ?? []),
-                    ...(courses ?? []),
-                  ]),
-                ),
-              ]),
-            ),
+            ...qualifiedByOffice,
           },
           assignmentMode:
             setting.auto_assign === false
@@ -820,36 +782,11 @@ useEffect(() => {
     saveData("unite-fleet-fixed-days-off", fixedDaysOff);
   }, [fixedDaysOff, localDataReady]);
 
-useEffect(() => {
-  if (!localDataReady) return;
+  useEffect(() => {
+    if (!localDataReady) return;
+    saveData("unite-fleet-course-settings", courseSettings);
+  }, [courseSettings, localDataReady]);
 
-  // ローカルへ保存
-  saveData("unite-fleet-course-settings", courseSettings);
-
-  // 管理者ログインしていなければローカル保存だけ
-  if (!session) return;
-
-  // Supabaseのfleet_masterにも自動反映
-  const syncCourseSettingsToCloud = async () => {
-    const { error } = await supabase
-      .from("fleet_master")
-      .update({
-        course_settings: courseSettings,
-        updated_by: session.user.id,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", "default");
-
-    if (error) {
-      console.error("コース設定の自動同期エラー:", error);
-      return;
-    }
-
-    console.log("コース設定をクラウドへ自動同期しました");
-  };
-
-  void syncCourseSettingsToCloud();
-}, [courseSettings, localDataReady, session]);
   const updateCourseSetting = (id: string, patch: Partial<CourseSetting>) => {
     setCourseSettings((previous) =>
       previous.map((setting) =>
@@ -858,43 +795,29 @@ useEffect(() => {
     );
   };
 
-const addCourseSetting = () => {
-  const name = newCourseName.trim();
+  const addCourseSetting = () => {
+    const name = newCourseName.trim();
+    if (!name) return alert("コース名を入力してください");
+    if (
+      courseSettings.some(
+        (setting) => setting.region === activeTab && setting.name === name,
+      )
+    ) {
+      return alert("同じコース名がすでにあります");
+    }
+    setCourseSettings((previous) => [
+      ...previous,
+      {
+        id: `${activeTab}-${Date.now()}`,
+        region: activeTab,
+        name,
+        closedWeekdays: [],
+        fixedDriver: "",
+      },
+    ]);
+    setNewCourseName("");
+  };
 
-  if (!name) {
-    return alert("コース名を入力してください");
-  }
-
-  if (
-    courseSettings.some(
-      (setting) =>
-        setting.region === activeTab &&
-        setting.name === name,
-    )
-  ) {
-    return alert("同じコース名がすでにあります");
-  }
-
-  const nextCourseSettings: CourseSetting[] = [
-    ...courseSettings,
-    {
-      id: `${activeTab}-${Date.now()}`,
-      region: activeTab,
-      name,
-      closedWeekdays: [],
-      fixedDriver: "",
-    },
-  ];
-
-  setCourseSettings(nextCourseSettings);
-
-  saveData(
-    "unite-fleet-course-settings",
-    nextCourseSettings,
-  );
-
-  setNewCourseName("");
-};
   const deleteCourseSetting = (id: string) => {
     if (!confirm("このコース設定を削除しますか？")) return;
     setCourseSettings((previous) =>
@@ -1105,29 +1028,41 @@ if (priorityError) {
     );
     const eligibleRegions = new Map<string, Set<Region>>();
 
-    // 担当可能コースが登録されているサブ営業所も正式な配置対象にする。
-    // 以前は area / coursePriority に入っている営業所しか eligibleRegions に入らず、
-    // supportedCoursesByOffice に伊勢を登録していても自動作成では伊勢候補から外れることがあった。
-    uniqueDrivers.forEach((driver) => {
+    standbyDrivers.forEach((driver) => {
+      const region = driver.area.replace("営業所", "") as Region;
       const regions = eligibleRegions.get(driver.name) ?? new Set<Region>();
-
-      (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
-        if (driver.mainArea === region) {
-          regions.add(region);
-          return;
-        }
-
-        if (getSupportedCoursesForRegion(driver, region).length > 0) {
-          regions.add(region);
-        }
-      });
-
+      regions.add(region);
       eligibleRegions.set(driver.name, regions);
     });
+coursePriorityMap.forEach((priorities, normalizedName) => {
+  const driver = uniqueDrivers.find(
+    (item) =>
+      normalizeDriverName(item.name) === normalizedName
+  );
 
-// コース優先順位は「順位付け」だけに使用する。
-// 営業所への配置可否は supportedCoursesByOffice（担当可能コース）だけで判定する。
-        const configuredCoursesForRegion = (
+  if (!driver) return;
+
+  const regions =
+    eligibleRegions.get(driver.name) ?? new Set<Region>();
+
+  priorities.forEach((priority) => {
+    const region = priority.office.replace(
+      "営業所",
+      ""
+    ) as Region;
+
+    if (
+      region === "松阪" ||
+      region === "伊勢" ||
+      region === "伊賀"
+    ) {
+      regions.add(region);
+    }
+  });
+
+  eligibleRegions.set(driver.name, regions);
+});
+    const configuredCoursesForRegion = (
       driverName: string,
       region: Region,
     ) =>
@@ -1135,12 +1070,24 @@ if (priorityError) {
         (priority) => priority.office.replace("営業所", "") === region,
       );
 
-    // 優先コースは配置可否には使わない。担当可能コースだけがハード条件。
     const isConfiguredCourse = (
-      _driverName: string,
-      _region: Region,
-      _courseName: string,
-    ) => true;
+      driverName: string,
+      region: Region,
+      courseName: string,
+    ) => {
+      const driver = uniqueDrivers.find(
+        (item) =>
+          normalizeDriverName(item.name) === normalizeDriverName(driverName),
+      );
+      if (!driver || driver.mainArea === region) return true;
+
+      const configuredCourses = configuredCoursesForRegion(driverName, region);
+      if (configuredCourses.length === 0) return true;
+      return canDriveCourse(
+        configuredCourses.map((priority) => priority.course),
+        courseName,
+      );
+    };
     const requiredCourseCountByRegion = new Map<Region, number>(
       (["松阪", "伊勢", "伊賀"] as Region[]).map((region) => [
         region,
@@ -1494,18 +1441,6 @@ if (priorityError) {
       ]),
     );
 
-    // 東 真規：月曜休み。火〜土は神久、日曜は神久・朝熊を原則出勤。
-    // 個別に登録された希望休は requestedOff() で最優先される。
-    uniqueDrivers.forEach((driver) => {
-      if (normalizeDriverName(driver.name) !== normalizeDriverName("東 真規")) return;
-      const condition = parsedConditions.get(driver.name);
-      if (!condition) return;
-      condition.weeklyDaysOff.add(1);
-      [0, 2, 3, 4, 5, 6].forEach((weekday) =>
-        condition.requiredWorkDays.add(weekday),
-      );
-    });
-
     const shouldBalanceDriver = (driver: DriverItem) => {
       if (
         driver.assignmentMode === "自動除外" ||
@@ -1616,6 +1551,8 @@ if (priorityError) {
             // この営業所の「このコース」が担当可能として登録済みの人だけ候補にする。
             if (!canDriverHandleCourse(driver, region, course.course))
               return false;
+            if (!isConfiguredCourse(driver.name, region, course.course))
+              return false;
             if (!fixedCourseMatches(driver.fixedCourse, course.course))
               return false;
             if (assignedToday.has(driver.name)) return false;
@@ -1629,7 +1566,11 @@ if (priorityError) {
                 regionalWorkCounts.get(
                   regionalCountKey(region, driver.name),
                 ) ?? 0;
-              if (currentRegionalCount >= target) return false;
+              if (
+                currentRegionalCount >= target &&
+                !canAddSupportBeyondRegionalTarget(driver, region)
+              )
+                return false;
             }
             const maximumWorkDays = parsedConditions.get(
               driver.name,
@@ -1639,7 +1580,7 @@ if (priorityError) {
                 return false;
             }
             if ((streaks.get(driver.name) ?? 0) >= 6) return false;
-            if (normalizeDriverName(driver.name) === normalizeDriverName("東 真規"))
+            if (driver.name === "東 真規")
               return (
                 weekday !== 1 &&
                 (course.course === "神久コース" ||
@@ -1665,49 +1606,6 @@ if (priorityError) {
           })
           .map((course) => {
             if (course.isLocked && course.driver) return course;
-
-            // 東 真規の固定条件は301・月間目標・候補採点より優先。
-            // 月曜と個別希望休だけ休み。それ以外は
-            // 火〜土＝神久、日曜＝神久・朝熊へ先に確定してロックする。
-            const eastDriver = uniqueDrivers.find(
-              (driver) =>
-                normalizeDriverName(driver.name) === normalizeDriverName("東 真規"),
-            );
-            const isEastFixedCourse =
-              region === "伊勢" &&
-              (course.course === "神久コース" ||
-                course.course === "神久・朝熊コース");
-            if (
-              eastDriver &&
-              isEastFixedCourse &&
-              weekday !== 1 &&
-              !requestedOff(eastDriver.name, day, weekday) &&
-              !assignedToday.has(eastDriver.name) &&
-              canDriverHandleCourse(eastDriver, region, course.course)
-            ) {
-              assignedToday.add(eastDriver.name);
-              workCounts.set(
-                eastDriver.name,
-                (workCounts.get(eastDriver.name) ?? 0) + 1,
-              );
-              regionalWorkCounts.set(
-                regionalCountKey(region, eastDriver.name),
-                (regionalWorkCounts.get(
-                  regionalCountKey(region, eastDriver.name),
-                ) ?? 0) + 1,
-              );
-              return {
-                ...course,
-                driver: eastDriver.name,
-                status: "配車済" as const,
-                memo:
-                  weekday === 0
-                    ? "固定条件：日曜 神久・朝熊"
-                    : "固定条件：神久",
-                isLocked: true,
-              };
-            }
-
             const courseSetting = courseSettings.find(
               (setting) =>
                 setting.region === region && setting.name === course.course,
@@ -1730,6 +1628,8 @@ if (priorityError) {
                 reasons.push("応援先限定");
               if (!canDriverHandleCourse(driver, region, course.course))
                 reasons.push("対応コース外");
+              if (!isConfiguredCourse(driver.name, region, course.course))
+                reasons.push("優先コース外");
               if (!fixedCourseMatches(driver.fixedCourse, course.course))
                 reasons.push("別コース固定");
               if (assignedToday.has(driver.name))
@@ -1760,15 +1660,12 @@ if (priorityError) {
               }
               if ((streaks.get(driver.name) ?? 0) >= 6)
                 reasons.push("7連勤防止");
-              if (
-                normalizeDriverName(driver.name) === normalizeDriverName("東 真規") &&
-                weekday === 1
-              )
+              if (driver.name === "東 真規" && weekday === 1)
                 reasons.push("月曜固定休");
               if (driver.name === "中川 昭治" && weekday === 4)
                 reasons.push("木曜固定休");
               if (
-                normalizeDriverName(driver.name) === normalizeDriverName("東 真規") &&
+                driver.name === "東 真規" &&
                 course.course !== "神久コース" &&
                 course.course !== "神久・朝熊コース"
               )
@@ -1802,44 +1699,12 @@ if (priorityError) {
             // 1) 24日前後へ届いていない通常ドライバー
             // 2) その他の通常ドライバー
             // 3) それでも誰もいない時だけ清水國光
-            // 301が成立している営業所では、営業所別の残り日数をハードに優先する。
-            // 例：横溝 伊勢3 / 楠滝 伊勢6 / 徳田 伊勢3 と入力した場合、
-            // その日数に達するまでは伊勢の通常候補の最上位グループにする。
-            const regionalTargetRemainingCandidates = regularCandidates.filter(
-              (driver) => {
-                if (!targetPlanCompleteByRegion.get(region)) return false;
-                const target =
-                  getGenerationTargetWorkDays(region, driver.name) ?? 0;
-                const actual =
-                  regionalWorkCounts.get(
-                    regionalCountKey(region, driver.name),
-                  ) ?? 0;
-                return target > actual;
-              },
-            );
-
-            const regionalUnderTotalCandidates =
-              regionalTargetRemainingCandidates.filter((driver) => {
-                const configuredMaximum =
-                  parsedConditions.get(driver.name)?.maximumWorkDays;
-                const desiredTotal =
-                  configuredMaximum ??
-                  Math.max(24, getGenerationTotalTarget(driver.name));
-                return (workCounts.get(driver.name) ?? 0) < desiredTotal;
-              });
-
-            // 301は営業所別の実配置目標。サブ営業所でも同じ扱い。
-            // 担当可能コースに合う限り、残り301日数がある人を通常候補より先に使う。
             const candidatePool =
-              regionalUnderTotalCandidates.length > 0
-                ? regionalUnderTotalCandidates
-                : regionalTargetRemainingCandidates.length > 0
-                  ? regionalTargetRemainingCandidates
-                  : underTargetRegularCandidates.length > 0
-                    ? underTargetRegularCandidates
-                    : regularCandidates.length > 0
-                      ? regularCandidates
-                      : eligibleCandidates;
+              underTargetRegularCandidates.length > 0
+                ? underTargetRegularCandidates
+                : regularCandidates.length > 0
+                  ? regularCandidates
+                  : eligibleCandidates;
 
             const candidates = candidatePool
               .sort((a, b) => {
@@ -1848,9 +1713,8 @@ if (priorityError) {
                     (courseSetting?.fixedDriver &&
                       normalizeDriverName(driver.name) ===
                         normalizeDriverName(courseSetting.fixedDriver)) ||
-                    (normalizeDriverName(driver.name) === normalizeDriverName("東 真規") &&
-                      (course.course === "神久コース" ||
-                        course.course === "神久・朝熊コース")) ||
+                    (driver.name === "東 真規" &&
+                      course.course === "神久コース") ||
                     (driver.name === "中川 昭治" && course.course === "Hコース")
                       ? -1000
                       : 0;
@@ -2104,6 +1968,7 @@ const coursePriorityPenalty =
           return false;
         if (requestedOff(driver.name, day, weekday)) return false;
         if (!canDriverHandleCourse(driver, region, courseName)) return false;
+        if (!isConfiguredCourse(driver.name, region, courseName)) return false;
         if (!fixedCourseMatches(driver.fixedCourse, courseName)) return false;
 
         if (driver.name === "東 真規" && weekday === 1) return false;
@@ -2467,6 +2332,7 @@ const coursePriorityPenalty =
           return false;
         if (requestedOff(driver.name, day, weekday)) return false;
         if (!canDriverHandleCourse(driver, region, courseName)) return false;
+        if (!isConfiguredCourse(driver.name, region, courseName)) return false;
         if (!fixedCourseMatches(driver.fixedCourse, courseName)) return false;
 
         if (driver.name === "東 真規" && weekday === 1) return false;
@@ -3010,6 +2876,7 @@ const coursePriorityPenalty =
                 if (driver.assignmentMode === "自動除外") return false;
                 if (!eligibleRegions.get(driver.name)?.has(region)) return false;
                 if (!canDriverHandleCourse(driver, region, currentCourse.course)) return false;
+                if (!isConfiguredCourse(driver.name, region, currentCourse.course)) return false;
                 if (!fixedCourseMatches(driver.fixedCourse, currentCourse.course)) return false;
                 if (requestedOff(driver.name, day, weekday)) return false;
 
@@ -3056,212 +2923,6 @@ const coursePriorityPenalty =
           }
 
           if (generated[dateKey]) generated[dateKey][region] = dayCourses;
-        }
-      }
-
-      // ===== 301営業所別日数を「実配置」に強制反映 =====
-      // これまでは301の数字を採点に使うだけだったため、
-      // 「伊勢3日」と指定していても松阪だけで配置が完成すると伊勢0日の候補が残ることがあった。
-      // ここでは完成したシフトを見直し、営業所別301が不足している通常ドライバーへ
-      // 同じ営業所の「301超過ドライバー」の枠を直接振り替える。
-      const getActualRegionalDays = (driverName: string, region: Region) => {
-        let count = 0;
-        for (let d = 1; d <= lastDay; d += 1) {
-          const key = `${autoMonth}-${String(d).padStart(2, "0")}`;
-          const worked = (generated[key]?.[region] ?? []).some(
-            (item) =>
-              item.driver &&
-              normalizeDriverName(item.driver) === normalizeDriverName(driverName),
-          );
-          if (worked) count += 1;
-        }
-        return count;
-      };
-
-      // 入力済みの301は、営業所全体の合計が完全一致していなくても実配置へ反映する。
-      // 以前は targetPlanCompleteByRegion が true の時しか実行されず、
-      // 横溝3日・楠滝6日・徳田3日と入力しても伊勢0日のままになることがあった。
-      const exactTargetRegions = (["伊勢", "伊賀", "松阪"] as Region[]).filter(
-        (region) =>
-          uniqueDrivers.some(
-            (driver) =>
-              (getTargetWorkDays(autoMonth, region, driver.name) ?? 0) > 0,
-          ),
-      );
-
-      for (const region of exactTargetRegions) {
-        // 少ない人から先に301不足を埋める。複数周して交換後の数字を再評価する。
-        for (let balancePass = 0; balancePass < 8; balancePass += 1) {
-          let changed = 0;
-
-          const deficitDrivers = uniqueDrivers
-            .filter((driver) => {
-              const target =
-                getTargetWorkDays(autoMonth, region, driver.name) ??
-                getGenerationTargetWorkDays(region, driver.name) ??
-                0;
-              if (target <= 0) return false;
-              return getActualRegionalDays(driver.name, region) < target;
-            })
-            .sort((a, b) => {
-              const aTotal = countActualWorkedDates(a.name).size;
-              const bTotal = countActualWorkedDates(b.name).size;
-              if (aTotal !== bTotal) return aTotal - bTotal;
-              const aDef =
-                (getTargetWorkDays(autoMonth, region, a.name) ??
-                  getGenerationTargetWorkDays(region, a.name) ??
-                  0) -
-                getActualRegionalDays(a.name, region);
-              const bDef =
-                (getTargetWorkDays(autoMonth, region, b.name) ??
-                  getGenerationTargetWorkDays(region, b.name) ??
-                  0) -
-                getActualRegionalDays(b.name, region);
-              return bDef - aDef;
-            });
-
-          for (const receiver of deficitDrivers) {
-            let receiverDeficit =
-              (getTargetWorkDays(autoMonth, region, receiver.name) ??
-                getGenerationTargetWorkDays(region, receiver.name) ??
-                0) -
-              getActualRegionalDays(receiver.name, region);
-
-            if (receiverDeficit <= 0) continue;
-
-            for (let day = 1; day <= lastDay && receiverDeficit > 0; day += 1) {
-              const dateKey = `${autoMonth}-${String(day).padStart(2, "0")}`;
-              const weekday = new Date(year, month - 1, day).getDay();
-
-              if (requestedOff(receiver.name, day, weekday)) continue;
-
-              // 301で伊勢○日と指定された人が、その日に松阪へ入っている場合も
-              // 候補から外さず「同日営業所スワップ」で伊勢へ移せるようにする。
-              let receiverCurrent:
-                | { region: Region; index: number; course: Course }
-                | undefined;
-
-              (["松阪", "伊勢", "伊賀"] as Region[]).some((currentRegion) => {
-                const currentCourses = generated[dateKey]?.[currentRegion] ?? [];
-                const currentIndex = currentCourses.findIndex(
-                  (item) =>
-                    item.driver &&
-                    normalizeDriverName(item.driver) ===
-                      normalizeDriverName(receiver.name),
-                );
-                if (currentIndex < 0) return false;
-                receiverCurrent = {
-                  region: currentRegion,
-                  index: currentIndex,
-                  course: currentCourses[currentIndex],
-                };
-                return true;
-              });
-
-              if (receiverCurrent?.region === region) continue;
-
-              // 新しく出勤日を増やす場合だけ7連勤を確認。
-              // 同日営業所スワップなら出勤日は増えない。
-              if (!receiverCurrent && wouldCreateSevenDayStreak(receiver.name, dateKey)) {
-                continue;
-              }
-
-              const courses = generated[dateKey]?.[region] ?? [];
-
-              const donorIndexes = courses
-                .map((course, index) => ({ course, index }))
-                .filter(({ course }) => {
-                  if (!course.driver || course.isLocked) return false;
-                  if (!canDriverHandleCourse(receiver, region, course.course)) return false;
-                  if (!fixedCourseMatches(receiver.fixedCourse, course.course)) return false;
-
-                  const donor = uniqueDrivers.find(
-                    (driver) =>
-                      normalizeDriverName(driver.name) ===
-                      normalizeDriverName(course.driver!),
-                  );
-                  if (!donor) return false;
-
-                  // receiverが松阪等に既に入っている場合、
-                  // donorもreceiverの元コースを担当できる時だけ2者交換する。
-                  if (receiverCurrent) {
-                    if (receiverCurrent.course.isLocked) return false;
-                    if (
-                      !canDriverHandleCourse(
-                        donor,
-                        receiverCurrent.region,
-                        receiverCurrent.course.course,
-                      )
-                    ) return false;
-                    if (
-                      !fixedCourseMatches(
-                        donor.fixedCourse,
-                        receiverCurrent.course.course,
-                      )
-                    ) return false;
-                  }
-
-                  const donorTarget =
-                    getGenerationTargetWorkDays(region, donor.name) ?? 0;
-                  const donorActual = getActualRegionalDays(donor.name, region);
-                  const donorIsReserve =
-                    normalizeDriverName(donor.name) === kunimitsuName ||
-                    donor.assignmentMode === "自動除外";
-
-                  return donorActual > donorTarget || Boolean(receiverCurrent && donorIsReserve);
-                })
-                .sort((a, b) => {
-                  const donorScore = (entry: { course: Course; index: number }) => {
-                    const donorName = entry.course.driver ?? "";
-                    const donor = uniqueDrivers.find(
-                      (driver) =>
-                        normalizeDriverName(driver.name) ===
-                        normalizeDriverName(donorName),
-                    );
-                    if (!donor) return 999999;
-                    const target =
-                      getGenerationTargetWorkDays(region, donor.name) ?? 0;
-                    const actual = getActualRegionalDays(donor.name, region);
-                    const isKunimitsu =
-                      normalizeDriverName(donor.name) === kunimitsuName;
-                    return (isKunimitsu ? -100000 : 0) - (actual - target) * 1000;
-                  };
-                  return donorScore(a) - donorScore(b);
-                });
-
-              const selected = donorIndexes[0];
-              if (!selected) continue;
-
-              const donorName = selected.course.driver ?? "";
-
-              courses[selected.index] = {
-                ...selected.course,
-                driver: receiver.name,
-                status: "配車済" as const,
-                memo: `301自動調整：${region}${getTargetWorkDays(autoMonth, region, receiver.name) ?? getGenerationTargetWorkDays(region, receiver.name)}日を優先`,
-              };
-              generated[dateKey][region] = courses;
-
-              // 同日に別営業所へ入っていた場合は、交換元ドライバーをreceiverの元コースへ移す。
-              // これで同日重複なしで営業所別301を満たせる。
-              if (receiverCurrent && donorName) {
-                const oldRegionCourses =
-                  generated[dateKey]?.[receiverCurrent.region] ?? [];
-                oldRegionCourses[receiverCurrent.index] = {
-                  ...receiverCurrent.course,
-                  driver: donorName,
-                  status: "配車済" as const,
-                  memo: `301同日営業所入替：${receiver.name}→${region}`,
-                };
-                generated[dateKey][receiverCurrent.region] = oldRegionCourses;
-              }
-
-              receiverDeficit -= 1;
-              changed += 1;
-            }
-          }
-
-          if (changed === 0) break;
         }
       }
 
@@ -3810,9 +3471,20 @@ const getConsecutiveWorkCount = (
 
   return count;
 };
-const monthlyDateKeys = Object.keys(shiftsByDate)
-  .filter((dateKey) => dateKey.startsWith(`${autoMonth}-`))
-  .sort();
+// 月間表の日付列は shiftsByDate にデータがある日だけではなく、
+// 選択中の月の日付を1日〜月末まで必ず作る。
+// これで15〜21日など、まだシフトデータが無い週でも日付列が消えない。
+const [monthlyYear, monthlyMonth] = autoMonth.split("-").map(Number);
+const daysInSelectedMonth =
+  monthlyYear && monthlyMonth
+    ? new Date(monthlyYear, monthlyMonth, 0).getDate()
+    : 0;
+
+const monthlyDateKeys = Array.from(
+  { length: daysInSelectedMonth },
+  (_, index) =>
+    `${autoMonth}-${String(index + 1).padStart(2, "0")}`,
+);
 const weekLabels = [
   "1〜7日",
   "8〜14日",
@@ -3825,24 +3497,15 @@ const displayedDateKeys = monthlyDateKeys.slice(
   selectedWeek * 7,
   selectedWeek * 7 + 7,
 );
-// 月間表の行は表示を固定する。
-// 通常版でも A〜H と AB/BC/CD の行は残し、使わない日は「―」表示。
-// 伊勢も通常コースと曜日版の結合コースを残す。
-// 「その日だけコース変更」で追加したコースも消さない。
-const monthlyCourseNames = Array.from(
-  new Set([
-    ...NORMAL_COURSE_NAMES[activeTab],
-    ...(activeTab === "松阪"
-      ? ["ABコース", "BCコース", "CDコース"]
-      : []),
-    ...(activeTab === "伊勢"
-      ? ["神久・朝熊コース", "御薗・高向コース"]
-      : []),
-    ...monthlyDateKeys.flatMap(
-      (dateKey) => dailyCourseOverrides[dateKey]?.[activeTab] ?? [],
-    ),
-  ]),
+// 月間シフト表の行は「登録されている基本コース」を固定表示する。
+// AB/BC/CDなどの結合コースは別行として増やさず、その日のセル側で扱う。
+// これで A〜H + 追加コース（例: 高町）のシンプルな表を維持する。
+const monthlyCourseNames = uniqueCourseNames(
+  courseSettings
+    .filter((setting) => setting.region === activeTab)
+    .map((setting) => setting.name),
 );
+
   const signIn = async () => {
     setCloudBusy(true);
     setCloudMessage("");
@@ -3914,7 +3577,7 @@ const monthlyCourseNames = Array.from(
         isLocked: Boolean(row.is_locked),
       };
       const existing = loaded[date][region].findIndex(
-        (item) => item.course === row.course,
+        (item) => sameCourseName(item.course, row.course),
       );
       if (existing >= 0) loaded[date][region][existing] = nextCourse;
       else loaded[date][region].push(nextCourse);
@@ -3954,36 +3617,31 @@ const monthlyCourseNames = Array.from(
 
   const finalChecks = useMemo(() => {
     const issues: string[] = [];
-    const monthDates = Object.keys(shiftsByDate)
-      .filter((date) => date.startsWith(`${autoMonth}-`))
-      .sort();
+    // 7連勤判定は「シフトデータが存在する日」だけを並べると、
+    // 休みの日が配列から抜けて前後の勤務日が連続扱いになる。
+    // そのため対象月の1日〜月末を必ず全日作って判定する。
+    const [checkYear, checkMonth] = autoMonth.split("-").map(Number);
+    const checkDaysInMonth =
+      checkYear && checkMonth
+        ? new Date(checkYear, checkMonth, 0).getDate()
+        : 0;
+    const monthDates = Array.from(
+      { length: checkDaysInMonth },
+      (_, index) =>
+        `${autoMonth}-${String(index + 1).padStart(2, "0")}`,
+    );
     const workedDates = new Map<string, Set<string>>();
 
     monthDates.forEach((date) => {
       const seen = new Map<string, string>();
-      const expectedCourses = createCoursesFromSettings(date, courseSettings);
-      (Object.keys(expectedCourses) as Region[]).forEach((region) => {
-        expectedCourses[region] = resolveCourseNamesForDate(
-          date,
-          region,
-          coursePreset,
-          dailyCourseOverrides[date]?.[region],
-        ).map((courseName, index) =>
-          createCourse(Date.now() + index, courseName),
-        );
-      });
-      (Object.keys(shiftsByDate[date]) as Region[]).forEach((region) => {
-        expectedCourses[region].forEach((expected) => {
-          const exists = shiftsByDate[date][region].some(
-            (course) => course.course === expected.course,
-          );
-          if (!exists) {
-            issues.push(
-              `${date} ${region} ${expected.course}：コース不足・未配置`,
-            );
-          }
-        });
-        shiftsByDate[date][region].forEach((course) => {
+      const dayShift = shiftsByDate[date];
+      if (!dayShift) return;
+
+      (Object.keys(dayShift) as Region[]).forEach((region) => {
+        // 手動編集後は、現在のシフト表に存在するコースを正として判定する。
+        // courseSettings から再生成した旧名称（Aコース等）との比較で
+        // 「コース不足・未配置」を二重/誤判定しない。
+        dayShift[region].forEach((course) => {
           if (!course.driver || course.status === "未配車") {
             issues.push(
               `${date} ${region} ${course.course}：未配置${course.memo ? `（${course.memo}）` : ""}`,
@@ -4299,19 +3957,11 @@ const monthlyCourseNames = Array.from(
                 </h2>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-<input
-  type="date"
-  value={selectedDate}
-  onChange={(event) => {
-    const nextDate = event.target.value;
-
-    setSelectedDate(nextDate);
-    setAutoMonth(nextDate.slice(0, 7));
-    setSelectedWeek(
-      Math.floor((Number(nextDate.slice(8, 10)) - 1) / 7)
-    );
-  }}
-  className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200"
+                <input
+                  type="date"
+                  value={selectedDate}
+                  onChange={(event) => setSelectedDate(event.target.value)}
+                  className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200"
                 />
                 <div className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-slate-300">
                   {today}
@@ -5303,40 +4953,6 @@ const monthlyCourseNames = Array.from(
     <p className="mt-1 text-sm text-slate-400">
       ドライバー名を選択すると、その日のシフトを手動変更できます。
     </p>
-
-    <div className="mt-4 flex flex-wrap items-center gap-2">
-      <span className="text-sm font-bold text-amber-300">
-        🔎 ドライバー検索
-      </span>
-      <input
-        type="search"
-        list="shift-driver-search-list"
-        value={shiftDriverSearch}
-        onChange={(event) => setShiftDriverSearch(event.target.value)}
-        placeholder="名前を入力"
-        className="w-56 rounded-lg border border-amber-400/40 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus:border-amber-300 focus:ring-2 focus:ring-amber-400/20"
-      />
-      <datalist id="shift-driver-search-list">
-        {getUniqueDrivers().map((driver) => (
-          <option key={driver.name} value={driver.name} />
-        ))}
-      </datalist>
-      {shiftDriverSearch && (
-        <button
-          type="button"
-          onClick={() => setShiftDriverSearch("")}
-          className="rounded-lg border border-white/10 bg-slate-800 px-3 py-2 text-xs font-bold text-slate-300 hover:bg-slate-700"
-        >
-          検索解除
-        </button>
-      )}
-      {shiftDriverSearch && (
-        <span className="text-xs font-semibold text-amber-300">
-          金色＝検索したドライバー
-        </span>
-      )}
-    </div>
-
     <div className="mt-4 flex flex-wrap gap-2">
   {weekLabels.map((label, index) => (
     <button
@@ -5388,7 +5004,7 @@ const monthlyCourseNames = Array.from(
           {monthlyCourseNames.map((courseName) => (
             <tr key={courseName}>
               <td className="sticky left-0 z-10 border border-white/10 bg-slate-900 px-3 py-2 font-bold text-white">
-                {courseName}
+                {normalizeCourseName(courseName)}
               </td>
 
               {displayedDateKeys.map((dateKey) => {
@@ -5398,30 +5014,38 @@ const monthlyCourseNames = Array.from(
                   coursePreset,
                   dailyCourseOverrides[dateKey]?.[activeTab],
                 );
-                const course = effectiveCourseNames.includes(courseName)
-                  ? (
-                      shiftsByDate[dateKey]?.[activeTab] ?? []
-                    ).find((item) => item.course === courseName)
-                  : undefined;
+                const baseName = normalizeCourseName(courseName);
+                const dayCourses = shiftsByDate[dateKey]?.[activeTab] ?? [];
 
-                const normalizedSearch =
-                  normalizeDriverName(shiftDriverSearch).toLowerCase();
-                const normalizedAssignedDriver = course?.driver
-                  ? normalizeDriverName(course.driver).toLowerCase()
-                  : "";
-                const isSearchedDriver =
-                  Boolean(normalizedSearch) &&
-                  Boolean(normalizedAssignedDriver) &&
-                  normalizedAssignedDriver.includes(normalizedSearch);
+                // 通常は同じ基本コースを表示。
+                // 結合コースは別行を作らず、先頭側の基本行に表示する。
+                // 例: AB→A行、BC→B行、CD→C行、神久・朝熊→神久行。
+                const mergedCourseForBase = dayCourses.find((item) => {
+                  const mergedName = normalizeCourseName(item.course);
+                  if (sameCourseName(item.course, courseName)) return true;
+
+                  if (activeTab === "松阪") {
+                    if (baseName === "A" && mergedName === "AB") return true;
+                    if (baseName === "B" && mergedName === "BC") return true;
+                    if (baseName === "C" && mergedName === "CD") return true;
+                  }
+
+                  if (activeTab === "伊勢") {
+                    if (baseName === "神久" && mergedName === "神久・朝熊")
+                      return true;
+                    if (baseName === "御薗" && mergedName === "御薗・高向")
+                      return true;
+                  }
+
+                  return false;
+                });
+
+                const course = mergedCourseForBase;
 
                 return (
                   <td
                     key={`${dateKey}-${courseName}`}
-                    className={`border p-2 ${
-                      isSearchedDriver
-                        ? "border-amber-300 bg-amber-400/15 shadow-[inset_0_0_18px_rgba(251,191,36,0.16)]"
-                        : "border-white/10"
-                    }`}
+                    className="border border-white/10 p-2"
                   >
                     {course ? (
                       <select
@@ -5434,11 +5058,7 @@ const monthlyCourseNames = Array.from(
                             event.target.value,
                           )
                         }
-                        className={`w-32 rounded-lg px-2 py-1.5 font-semibold ${
-                          isSearchedDriver
-                            ? "border-2 border-amber-300 bg-amber-400 text-slate-950 shadow-[0_0_18px_rgba(251,191,36,0.75)] ring-2 ring-amber-300/40"
-                            : "border border-white/10 bg-slate-800 text-slate-100"
-                        }`}
+                        className="w-32 rounded-lg border border-white/10 bg-slate-800 px-2 py-1.5 text-slate-100"
                       >
                         <option value="">未割当</option>
 
