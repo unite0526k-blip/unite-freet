@@ -424,6 +424,10 @@ export default function ShiftPage() {
   const [dayOffRequestRows, setDayOffRequestRows] = useState<
     Array<{ driver_name: string; requested_date: string }>
   >([]);
+  // 希望休一覧の表示月。自動作成の対象月とは別に切り替えられる。
+  const [dayOffListMonth, setDayOffListMonth] = useState(() =>
+    formatDateKey(new Date()).slice(0, 7),
+  );
   const [dayOffRequestMessage, setDayOffRequestMessage] = useState("");
   const [dayOffRequestRefreshKey, setDayOffRequestRefreshKey] = useState(0);
   const [shiftsByDate, setShiftsByDate] = useState<ShiftsByDate>({});
@@ -558,7 +562,7 @@ export default function ShiftPage() {
       const { data, error } = await supabase
         .from("shift_day_off_requests")
         .select("driver_name,requested_date")
-        .eq("target_month", autoMonth)
+        .eq("target_month", dayOffListMonth)
         .order("requested_date", { ascending: true });
 
       if (error) {
@@ -577,7 +581,7 @@ export default function ShiftPage() {
     };
 
     void loadDayOffRequests();
-  }, [session, autoMonth, dayOffRequestRefreshKey]);
+  }, [session, dayOffListMonth, dayOffRequestRefreshKey]);
 
   useEffect(() => {
     if (!session) return;
@@ -3522,25 +3526,59 @@ const monthlyCourseNames = uniqueCourseNames(
     if (!error) setAuthPassword("");
   };
 
+  const canonicalMonthKey = (value: string) => {
+    const match = String(value ?? "").trim().match(/^(\\d{4})-(\\d{1,2})$/);
+    if (!match) return String(value ?? "").trim();
+    return `${match[1]}-${match[2].padStart(2, "0")}`;
+  };
+
   const loadCloudMonth = async () => {
     if (!session) return setCloudMessage("先に管理者ログインしてください。");
     setCloudBusy(true);
     setCloudMessage("");
-    const { data: monthRow, error: monthError } = await supabase
+    const cloudMonthKey = canonicalMonthKey(autoMonth);
+
+    // 共有画面と同じ公開済み月を最優先で読む
+    const { data: publishedMonth, error: publishedMonthError } = await supabase
       .from("shift_months")
       .select("id,status")
-      .eq("month_key", autoMonth)
+      .eq("month_key", cloudMonthKey)
+      .eq("status", "published")
+      .limit(1)
       .maybeSingle();
-    if (monthError || !monthRow) {
+
+    if (publishedMonthError) {
       setCloudBusy(false);
-      setMonthStatus("draft");
-      setCloudMessage(
-        monthError
-          ? `読込エラー：${monthError.message}`
-          : `${autoMonth}のクラウドデータはまだありません。`,
-      );
+      setCloudMessage(`読込エラー：${publishedMonthError.message}`);
       return;
     }
+
+    let monthRow = publishedMonth;
+
+    // 公開済みが無い月だけ下書きを読む
+    if (!monthRow) {
+      const { data: draftRows, error: draftError } = await supabase
+        .from("shift_months")
+        .select("id,status")
+        .eq("month_key", cloudMonthKey)
+        .eq("status", "draft")
+        .limit(1);
+
+      if (draftError) {
+        setCloudBusy(false);
+        setCloudMessage(`読込エラー：${draftError.message}`);
+        return;
+      }
+      monthRow = draftRows?.[0] ?? null;
+    }
+
+    if (!monthRow) {
+      setCloudBusy(false);
+      setMonthStatus("draft");
+      setCloudMessage(`${cloudMonthKey}のクラウドデータはまだありません。`);
+      return;
+    }
+
     const [
       { data: assignments, error: assignmentError },
       { data: conditions, error: conditionError },
@@ -3555,6 +3593,7 @@ const monthlyCourseNames = uniqueCourseNames(
         .select("driver_name,condition_text")
         .eq("shift_month_id", monthRow.id),
     ]);
+
     if (assignmentError || conditionError) {
       setCloudBusy(false);
       setCloudMessage(
@@ -3562,30 +3601,46 @@ const monthlyCourseNames = uniqueCourseNames(
       );
       return;
     }
+
+    // 0件データで現在の管理画面を消さない
+    if ((assignments ?? []).length === 0) {
+      setCloudBusy(false);
+      setMonthStatus(monthRow.status as "draft" | "published");
+      setCloudMessage(
+        `${cloudMonthKey}のクラウド月は見つかりましたが、配置データが0件です。現在の画面は保持しました。`,
+      );
+      return;
+    }
+
     const loaded: ShiftsByDate = {};
     (assignments ?? []).forEach((row, index) => {
-      const date = String(row.work_date);
-      const region = row.area as Region;
-      if (!loaded[date]) {
-        loaded[date] = { 松阪: [], 伊勢: [], 伊賀: [] };
-      }
+      const date = String(row.work_date).slice(0, 10);
+      const rawArea = String(row.area ?? "").replace("営業所", "");
+      if (rawArea !== "松阪" && rawArea !== "伊勢" && rawArea !== "伊賀") return;
+      const region = rawArea as Region;
+
+      if (!loaded[date]) loaded[date] = { 松阪: [], 伊勢: [], 伊賀: [] };
+
       const nextCourse: Course = {
-        ...createCourse(Date.now() + index, row.course),
+        ...createCourse(Date.now() + index, String(row.course ?? "")),
         driver: row.driver_name ?? "",
         status: row.status as CourseStatus,
         memo: row.memo ?? "",
         isLocked: Boolean(row.is_locked),
       };
-      const existing = loaded[date][region].findIndex(
-        (item) => sameCourseName(item.course, row.course),
+
+      const existing = loaded[date][region].findIndex((item) =>
+        sameCourseName(item.course, nextCourse.course),
       );
       if (existing >= 0) loaded[date][region][existing] = nextCourse;
       else loaded[date][region].push(nextCourse);
     });
+
     const loadedConditions: RequestedDaysOff = {};
     (conditions ?? []).forEach((row) => {
       loadedConditions[row.driver_name] = row.condition_text;
     });
+
     const loadedOverrides: DailyCourseOverrides = {};
     Object.entries(loaded).forEach(([date, regions]) => {
       (Object.keys(regions) as Region[]).forEach((region) => {
@@ -3599,84 +3654,143 @@ const monthlyCourseNames = uniqueCourseNames(
         }
       });
     });
-    setShiftsByDate((previous) => ({ ...previous, ...loaded }));
-    setDailyCourseOverrides((previous) => {
-      const next = Object.fromEntries(
-        Object.entries(previous).filter(
-          ([date]) => !date.startsWith(`${autoMonth}-`),
-        ),
-      ) as DailyCourseOverrides;
-      return { ...next, ...loadedOverrides };
+
+    // 選択月だけクラウドを正として完全置換。他の月は残す。
+    setShiftsByDate((previous) => {
+      const otherMonths = Object.fromEntries(
+        Object.entries(previous).filter(([date]) => !date.startsWith(`${cloudMonthKey}-`)),
+      ) as ShiftsByDate;
+      return { ...otherMonths, ...loaded };
     });
+
+    setDailyCourseOverrides((previous) => {
+      const otherMonths = Object.fromEntries(
+        Object.entries(previous).filter(([date]) => !date.startsWith(`${cloudMonthKey}-`)),
+      ) as DailyCourseOverrides;
+      return { ...otherMonths, ...loadedOverrides };
+    });
+
     setRequestedDaysOff((previous) => ({ ...previous, ...loadedConditions }));
     setMonthStatus(monthRow.status as "draft" | "published");
-    setSelectedDate(`${autoMonth}-01`);
+    setSelectedDate(`${cloudMonthKey}-01`);
     setCloudBusy(false);
-    setCloudMessage(`${autoMonth}をクラウドから読み込みました。`);
+    setCloudMessage(
+      `${cloudMonthKey}をクラウドから読み込みました（${assignments?.length ?? 0}件）。`,
+    );
   };
 
   const finalChecks = useMemo(() => {
     const issues: string[] = [];
-    // 7連勤判定は「シフトデータが存在する日」だけを並べると、
-    // 休みの日が配列から抜けて前後の勤務日が連続扱いになる。
-    // そのため対象月の1日〜月末を必ず全日作って判定する。
     const [checkYear, checkMonth] = autoMonth.split("-").map(Number);
     const checkDaysInMonth =
-      checkYear && checkMonth
-        ? new Date(checkYear, checkMonth, 0).getDate()
-        : 0;
+      checkYear && checkMonth ? new Date(checkYear, checkMonth, 0).getDate() : 0;
     const monthDates = Array.from(
       { length: checkDaysInMonth },
-      (_, index) =>
-        `${autoMonth}-${String(index + 1).padStart(2, "0")}`,
+      (_, index) => `${autoMonth}-${String(index + 1).padStart(2, "0")}`,
     );
     const workedDates = new Map<string, Set<string>>();
 
-    monthDates.forEach((date) => {
-      const seen = new Map<string, string>();
-      const dayShift = shiftsByDate[date];
-      if (!dayShift) return;
+    const findActualCourse = (
+      dayCourses: Course[],
+      requiredCourseName: string,
+      region: Region,
+    ) => {
+      const exact = dayCourses.find((course) =>
+        sameCourseName(course.course, requiredCourseName),
+      );
+      if (exact) return exact;
 
-      (Object.keys(dayShift) as Region[]).forEach((region) => {
-        // 手動編集後は、現在のシフト表に存在するコースを正として判定する。
-        // courseSettings から再生成した旧名称（Aコース等）との比較で
-        // 「コース不足・未配置」を二重/誤判定しない。
-        dayShift[region].forEach((course) => {
-          if (!course.driver || course.status === "未配車") {
+      const required = normalizeCourseName(requiredCourseName);
+      if (region === "松阪") {
+        const baseForMerged: Record<string, string> = {
+          AB: "A",
+          BC: "B",
+          CD: "C",
+        };
+        const base = baseForMerged[required];
+        if (base) {
+          return dayCourses.find(
+            (course) => normalizeCourseName(course.course) === base,
+          );
+        }
+      }
+      if (region === "伊勢") {
+        if (required === "神久・朝熊") {
+          return dayCourses.find(
+            (course) => normalizeCourseName(course.course) === "神久",
+          );
+        }
+        if (required === "御薗・高向") {
+          return dayCourses.find(
+            (course) => normalizeCourseName(course.course) === "御薗",
+          );
+        }
+      }
+      return undefined;
+    };
+
+    monthDates.forEach((date) => {
+      const dayShift = shiftsByDate[date];
+      const seen = new Map<string, string>();
+
+      (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
+        const requiredCourseNames = resolveCourseNamesForDate(
+          date,
+          region,
+          coursePreset,
+          dailyCourseOverrides[date]?.[region],
+        );
+        const dayCourses = dayShift?.[region] ?? [];
+
+        requiredCourseNames.forEach((requiredCourseName) => {
+          const course = findActualCourse(dayCourses, requiredCourseName, region);
+          if (!course || !course.driver || course.status === "未配車") {
             issues.push(
-              `${date} ${region} ${course.course}：未配置${course.memo ? `（${course.memo}）` : ""}`,
+              `${date} ${region} ${requiredCourseName}：未配置${
+                course?.memo ? `（${course.memo}）` : ""
+              }`,
             );
             return;
           }
-          const previous = seen.get(course.driver);
+
+          const driverKey = normalizeDriverName(course.driver);
+          const previous = seen.get(driverKey);
           if (previous) {
             issues.push(
-              `${date} ${course.driver}：重複配置（${previous}／${region} ${course.course}）`,
+              `${date} ${course.driver}：重複配置（${previous}／${region} ${requiredCourseName}）`,
             );
           } else {
-            seen.set(course.driver, `${region} ${course.course}`);
+            seen.set(driverKey, `${region} ${requiredCourseName}`);
           }
-          const dates = workedDates.get(course.driver) ?? new Set<string>();
+
+          const dates = workedDates.get(driverKey) ?? new Set<string>();
           dates.add(date);
-          workedDates.set(course.driver, dates);
+          workedDates.set(driverKey, dates);
         });
       });
     });
 
-    workedDates.forEach((dates, driver) => {
+    workedDates.forEach((dates, driverKey) => {
       let streak = 0;
       monthDates.forEach((date) => {
         streak = dates.has(date) ? streak + 1 : 0;
-        if (streak === 7) issues.push(`${date} ${driver}：7連勤`);
+        if (streak === 7) {
+          const displayName =
+            getUniqueDrivers().find(
+              (driver) => normalizeDriverName(driver.name) === driverKey,
+            )?.name ?? driverKey;
+          issues.push(`${date} ${displayName}：7連勤`);
+        }
       });
     });
+
     return issues;
   }, [
     autoMonth,
     coursePreset,
-    courseSettings,
     dailyCourseOverrides,
     shiftsByDate,
+    standbyDrivers,
   ]);
 
   const saveCloudMonth = async (publish: boolean) => {
@@ -3689,12 +3803,13 @@ const monthlyCourseNames = uniqueCourseNames(
     }
     setCloudBusy(true);
     setCloudMessage("");
+    const cloudMonthKey = canonicalMonthKey(autoMonth);
     const nextStatus = publish ? "published" : "draft";
     const { data: monthRow, error: monthError } = await supabase
       .from("shift_months")
       .upsert(
         {
-          month_key: autoMonth,
+          month_key: cloudMonthKey,
           status: nextStatus,
           published_at: publish ? new Date().toISOString() : null,
           created_by: session.user.id,
@@ -3711,7 +3826,7 @@ const monthlyCourseNames = uniqueCourseNames(
       return;
     }
     const rows = Object.keys(shiftsByDate)
-      .filter((date) => date.startsWith(`${autoMonth}-`))
+      .filter((date) => date.startsWith(`${cloudMonthKey}-`))
       .flatMap((date) =>
         (Object.keys(shiftsByDate[date]) as Region[]).flatMap((region) =>
           shiftsByDate[date][region].map((course) => ({
@@ -3733,6 +3848,15 @@ const monthlyCourseNames = uniqueCourseNames(
         driver_name: driverName,
         condition_text: text,
       }));
+    // 安全装置：管理画面が空の状態ではクラウド既存シフトを削除しない
+    if (rows.length === 0) {
+      setCloudBusy(false);
+      setCloudMessage(
+        "保存を中止しました。現在の管理画面に保存対象シフトが0件のため、クラウドの既存データは削除していません。",
+      );
+      return;
+    }
+
     const { error: deleteAssignmentError } = await supabase
       .from("shift_assignments")
       .delete()
@@ -4798,21 +4922,36 @@ const monthlyCourseNames = uniqueCourseNames(
 
             <details className="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/5 p-4">
               <summary className="cursor-pointer text-base font-semibold text-white">
-                🗓️ ドライバー希望休一覧（{activeTab}・{autoMonth}）
+                🗓️ ドライバー希望休一覧（{activeTab}・{dayOffListMonth}）
               </summary>
-              <div className="mt-4 flex items-center justify-between gap-3">
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <p className="text-sm text-slate-400">
                   ドライバー本人が登録した希望休です。
                 </p>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setDayOffRequestRefreshKey((previous) => previous + 1)
-                  }
-                  className="rounded-lg border border-amber-300/30 bg-amber-300/10 px-3 py-1.5 text-sm font-semibold text-amber-200"
-                >
-                  最新に更新
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label
+                    htmlFor="day-off-list-month"
+                    className="text-sm font-semibold text-amber-100"
+                  >
+                    確認する月
+                  </label>
+                  <input
+                    id="day-off-list-month"
+                    type="month"
+                    value={dayOffListMonth}
+                    onChange={(event) => setDayOffListMonth(event.target.value)}
+                    className="rounded-lg border border-amber-300/30 bg-slate-900 px-3 py-1.5 text-sm font-semibold text-white [color-scheme:dark]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setDayOffRequestRefreshKey((previous) => previous + 1)
+                    }
+                    className="rounded-lg border border-amber-300/30 bg-amber-300/10 px-3 py-1.5 text-sm font-semibold text-amber-200"
+                  >
+                    最新に更新
+                  </button>
+                </div>
               </div>
               {dayOffRequestMessage && (
                 <p className="mt-3 text-sm text-amber-200">

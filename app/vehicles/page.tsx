@@ -6,6 +6,7 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase as maybeSupabase } from "../../lib/supabase";
 
 const supabase = maybeSupabase!;
+
 const OFFICES = [
   "松阪営業所",
   "伊勢営業所",
@@ -33,16 +34,27 @@ const DRIVERS_BY_OFFICE: Record<string, string[]> = {
   伊勢営業所: ["東 真規", "勝村 武史", "藤原 颯士", "西田 勇太"],
   鈴鹿営業所: ["仲村 賢一郎"],
   伊賀営業所: ["山崎 雅也", "辻本 顕寛", "小倉 祐司"],
-  浜松営業所: ["津嘉山 一君", "藤田 祥範", "レイネル セバスチャン"],
-  京都営業所: [],　　
+  浜松営業所: [
+    "津嘉山 一君",
+    "藤田 祥範",
+    "レイネル セバスチャン",
+  ],
+  京都営業所: [],
 };
+
+type VehicleStatus =
+  | "貸出中"
+  | "代車貸出中"
+  | "保管中"
+  | "廃車";
+
 type Vehicle = {
   id: number;
   office: string;
   number: string;
   driver: string;
 
-  status: "貸出中" | "保管中" | "廃車";
+  status: VehicleStatus;
   storageLocation: string;
 
   inspection: string;
@@ -54,273 +66,498 @@ type Vehicle = {
   firstRegistration: string;
   userName: string;
   ownerName: string;
+
+  // リース管理
+  leaseStartDate?: string;
+  monthlyLeaseFee?: number;
+
+  // 例：
+  // {
+  //   "2026-09": 18000
+  // }
+  // のように月ごとの特別金額を保存
+  leaseFeeOverrides?: Record<string, number>;
 };
 
 const STORAGE_KEY = "unite-fleet-vehicles";
+const DEFAULT_LEASE_FEE = 33000;
 
 export default function VehiclesPage() {
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [session, setSession] = useState<Session | null>(null);
+
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudMessage, setCloudMessage] = useState("");
-const [sortOrder, setSortOrder] = useState("registered");
- const [form, setForm] = useState({
-  office: "",
-  number: "",
-  driver: "",
-  status: "保管中" as Vehicle["status"],
-  storageLocation: "",
-  inspection: "",
-  insurance: "",
 
-  maker: "",
-  model: "",
-  chassisNumber: "",
-  firstRegistration: "",
-  userName: "",
-  ownerName: "",
-});
+  const [sortOrder, setSortOrder] = useState("registered");
+
+  const [form, setForm] = useState({
+    office: "",
+    number: "",
+    driver: "",
+    status: "保管中" as VehicleStatus,
+    storageLocation: "",
+    inspection: "",
+    insurance: "",
+
+    maker: "",
+    model: "",
+    chassisNumber: "",
+    firstRegistration: "",
+    userName: "",
+    ownerName: "",
+  });
 
   const [isLoaded, setIsLoaded] = useState(false);
 
-useEffect(() => {
-  supabase.auth.getSession().then(({ data }) => setSession(data.session));
+  // =========================
+  // 現在の年月
+  // =========================
 
-  const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-    setSession(nextSession);
-  });
+  const getCurrentMonthKey = () => {
+    const today = new Date();
 
-  return () => data.subscription.unsubscribe();
-}, []);
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, "0");
 
-useEffect(() => {
-  const saved = localStorage.getItem(STORAGE_KEY);
+    return `${year}-${month}`;
+  };
 
-  if (saved) {
-    setVehicles(JSON.parse(saved));
-  }
+  const currentMonthKey = getCurrentMonthKey();
 
-  setIsLoaded(true);
-}, []);
+  // =========================
+  // ログイン確認
+  // =========================
 
-useEffect(() => {
-  if (!isLoaded) return;
+  useEffect(() => {
+    supabase.auth
+      .getSession()
+      .then(({ data }) => setSession(data.session));
 
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify(vehicles)
+    const { data } = supabase.auth.onAuthStateChange(
+      (_event, nextSession) => {
+        setSession(nextSession);
+      }
+    );
+
+    return () => data.subscription.unsubscribe();
+  }, []);
+
+  // =========================
+  // ローカル読込
+  // =========================
+
+  useEffect(() => {
+    const saved = localStorage.getItem(STORAGE_KEY);
+
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+
+        if (Array.isArray(parsed)) {
+          setVehicles(parsed);
+        }
+      } catch {
+        console.error("車両データの読み込みに失敗しました");
+      }
+    }
+
+    setIsLoaded(true);
+  }, []);
+
+  // =========================
+  // ローカル保存
+  // =========================
+
+  useEffect(() => {
+    if (!isLoaded) return;
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(vehicles)
+    );
+  }, [vehicles, isLoaded]);
+
+  // =========================
+  // 車検・保険警告
+  // =========================
+
+  useEffect(() => {
+    if (!isLoaded || vehicles.length === 0) return;
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const getDaysLeft = (date: string) => {
+      if (!date) return null;
+
+      const targetDate = new Date(date);
+      targetDate.setHours(0, 0, 0, 0);
+
+      return Math.ceil(
+        (targetDate.getTime() - today.getTime()) /
+          (1000 * 60 * 60 * 24)
+      );
+    };
+
+    const warnings: string[] = [];
+
+    vehicles.forEach((vehicle) => {
+      if ((vehicle.status || "保管中") === "廃車") {
+        return;
+      }
+
+      const inspectionDays = getDaysLeft(vehicle.inspection);
+      const insuranceDays = getDaysLeft(vehicle.insurance);
+
+      if (
+        inspectionDays !== null &&
+        inspectionDays <= 30
+      ) {
+        warnings.push(
+          `車番 ${vehicle.number}：車検まであと${inspectionDays}日`
+        );
+      }
+
+      if (
+        insuranceDays !== null &&
+        insuranceDays <= 30
+      ) {
+        warnings.push(
+          `車番 ${vehicle.number}：保険期限まであと${insuranceDays}日`
+        );
+      }
+    });
+
+    if (warnings.length > 0) {
+      try {
+        const audioContext = new AudioContext();
+        const oscillator = audioContext.createOscillator();
+        const gainNode = audioContext.createGain();
+
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+
+        oscillator.type = "square";
+        oscillator.frequency.value = 880;
+        gainNode.gain.value = 0.15;
+
+        oscillator.start();
+        oscillator.stop(
+          audioContext.currentTime + 0.4
+        );
+      } catch {
+        // 音が禁止されても警告表示は続ける
+      }
+
+      setTimeout(() => {
+        alert(
+          `⚠️ 期限が近い車両があります\n\n${warnings.join(
+            "\n"
+          )}`
+        );
+      }, 500);
+    }
+  }, [isLoaded]);
+
+  // =========================
+  // クラウドから読込
+  // =========================
+
+  const loadVehiclesFromCloud = async () => {
+    if (!session) {
+      setCloudMessage(
+        "管理者ログイン後にクラウドから読み込めます。"
+      );
+      return;
+    }
+
+    setCloudBusy(true);
+    setCloudMessage("クラウドから読み込み中...");
+
+    const { data, error } = await supabase
+      .from("fleet_vehicle_master")
+      .select("vehicles")
+      .eq("id", "default")
+      .maybeSingle();
+
+    if (error) {
+      setCloudMessage(
+        `読込エラー：${error.message}`
+      );
+    } else if (!data) {
+      setCloudMessage(
+        "クラウドにはまだ車両データが保存されていません。"
+      );
+    } else {
+      const cloudVehicles = Array.isArray(data.vehicles)
+        ? (data.vehicles as Vehicle[])
+        : [];
+
+      setVehicles(cloudVehicles);
+
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify(cloudVehicles)
+      );
+
+      setCloudMessage(
+        `クラウドから車両${cloudVehicles.length}台を読み込みました。`
+      );
+    }
+
+    setCloudBusy(false);
+  };
+
+  // =========================
+  // クラウド保存
+  // =========================
+
+  const saveVehiclesToCloud = async () => {
+    if (!session) {
+      setCloudMessage(
+        "管理者ログイン後にクラウドへ保存できます。"
+      );
+      return;
+    }
+
+    setCloudBusy(true);
+    setCloudMessage("クラウドへ保存中...");
+
+    const { error } = await supabase
+      .from("fleet_vehicle_master")
+      .upsert({
+        id: "default",
+        vehicles,
+        updated_by: session.user.id,
+        updated_at: new Date().toISOString(),
+      });
+
+    if (error) {
+      setCloudMessage(
+        `保存エラー：${error.message}`
+      );
+    } else {
+      setCloudMessage(
+        `車両${vehicles.length}台をクラウド保存しました。`
+      );
+    }
+
+    setCloudBusy(false);
+  };
+
+  // =========================
+  // 車両登録
+  // =========================
+
+  const addVehicle = () => {
+    if (!form.office || !form.number) {
+      alert("営業所と車番は必須です");
+      return;
+    }
+
+    const newVehicle: Vehicle = {
+      id: Date.now(),
+
+      office: form.office,
+      number: form.number,
+      driver: form.driver,
+
+      status: form.status,
+      storageLocation: form.storageLocation,
+
+      inspection: form.inspection,
+      insurance: form.insurance,
+
+      maker: form.maker,
+      model: form.model,
+      chassisNumber: form.chassisNumber,
+      firstRegistration: form.firstRegistration,
+      userName: form.userName,
+      ownerName: form.ownerName,
+
+      leaseStartDate: "",
+      monthlyLeaseFee: DEFAULT_LEASE_FEE,
+      leaseFeeOverrides: {},
+    };
+
+    setVehicles((prev) => [
+      ...prev,
+      newVehicle,
+    ]);
+
+    setForm({
+      office: "",
+      number: "",
+      driver: "",
+      status: "保管中",
+      storageLocation: "",
+      inspection: "",
+      insurance: "",
+      maker: "",
+      model: "",
+      chassisNumber: "",
+      firstRegistration: "",
+      userName: "",
+      ownerName: "",
+    });
+  };
+
+  // =========================
+  // 削除
+  // =========================
+
+  const deleteVehicle = (id: number) => {
+    if (!confirm("削除しますか？")) return;
+
+    setVehicles(
+      vehicles.filter((v) => v.id !== id)
+    );
+  };
+
+  // =========================
+  // 日付並び替え
+  // =========================
+
+  const dateValue = (date: string) => {
+    const value = Date.parse(date);
+
+    return Number.isNaN(value)
+      ? Number.MAX_SAFE_INTEGER
+      : value;
+  };
+
+  const sortedVehicles = [...vehicles].sort(
+    (a, b) => {
+      if (sortOrder === "inspection") {
+        return (
+          dateValue(a.inspection) -
+          dateValue(b.inspection)
+        );
+      }
+
+      if (sortOrder === "insurance") {
+        return (
+          dateValue(a.insurance) -
+          dateValue(b.insurance)
+        );
+      }
+
+      if (sortOrder === "office") {
+        return a.office.localeCompare(
+          b.office,
+          "ja"
+        );
+      }
+
+      return 0;
+    }
   );
-}, [vehicles, isLoaded]);
-useEffect(() => {
-  if (!isLoaded || vehicles.length === 0) return;
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  // =========================
+  // 車検・保険色
+  // =========================
 
-  const getDaysLeft = (date: string) => {
-    if (!date) return null;
+  const getDateColor = (date: string) => {
+    if (!date) return "";
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
     const targetDate = new Date(date);
     targetDate.setHours(0, 0, 0, 0);
 
-    return Math.ceil(
+    const daysLeft = Math.ceil(
       (targetDate.getTime() - today.getTime()) /
         (1000 * 60 * 60 * 24)
     );
-  };
 
-  const warnings: string[] = [];
-
-  vehicles.forEach((vehicle) => {
-    const inspectionDays = getDaysLeft(vehicle.inspection);
-    const insuranceDays = getDaysLeft(vehicle.insurance);
-
-    if (inspectionDays !== null && inspectionDays <= 30) {
-      warnings.push(
-        `車番 ${vehicle.number}：車検まであと${inspectionDays}日`
-      );
+    if (daysLeft <= 7) {
+      return "bg-red-200 text-red-800 font-bold";
     }
 
-    if (insuranceDays !== null && insuranceDays <= 30) {
-      warnings.push(
-        `車番 ${vehicle.number}：保険期限まであと${insuranceDays}日`
-      );
+    if (daysLeft <= 14) {
+      return "bg-orange-200 text-orange-800 font-bold";
     }
-  });
 
-  if (warnings.length > 0) {
-  try {
-    const audioContext = new AudioContext();
-    const oscillator = audioContext.createOscillator();
-    const gainNode = audioContext.createGain();
+    if (daysLeft <= 30) {
+      return "bg-yellow-200 text-yellow-800 font-bold";
+    }
 
-    oscillator.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-
-    oscillator.type = "square";
-    oscillator.frequency.value = 880;
-    gainNode.gain.value = 0.15;
-
-    oscillator.start();
-    oscillator.stop(audioContext.currentTime + 0.4);
-  } catch {
-    // 音が禁止されても警告表示は続ける
-  }
-
-  setTimeout(() => {
-    alert(`⚠️ 期限が近い車両があります\n\n${warnings.join("\n")}`);
-  }, 500);
-}
-}, [isLoaded]);
-
-const loadVehiclesFromCloud = async () => {
-  if (!session) {
-    setCloudMessage("管理者ログイン後にクラウドから読み込めます。");
-    return;
-  }
-
-  setCloudBusy(true);
-  setCloudMessage("クラウドから読み込み中...");
-
-  const { data, error } = await supabase
-    .from("fleet_vehicle_master")
-    .select("vehicles")
-    .eq("id", "default")
-    .maybeSingle();
-
-  if (error) {
-    setCloudMessage(`読込エラー：${error.message}`);
-  } else if (!data) {
-    setCloudMessage("クラウドにはまだ車両データが保存されていません。");
-  } else {
-    const cloudVehicles = Array.isArray(data.vehicles)
-      ? (data.vehicles as Vehicle[])
-      : [];
-
-    setVehicles(cloudVehicles);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudVehicles));
-    setCloudMessage(`クラウドから車両${cloudVehicles.length}台を読み込みました。`);
-  }
-
-  setCloudBusy(false);
-};
-
-const saveVehiclesToCloud = async () => {
-  if (!session) {
-    setCloudMessage("管理者ログイン後にクラウドへ保存できます。");
-    return;
-  }
-
-  setCloudBusy(true);
-  setCloudMessage("クラウドへ保存中...");
-
-  const { error } = await supabase.from("fleet_vehicle_master").upsert({
-    id: "default",
-    vehicles,
-    updated_by: session.user.id,
-    updated_at: new Date().toISOString(),
-  });
-
-  if (error) {
-    setCloudMessage(`保存エラー：${error.message}`);
-  } else {
-    setCloudMessage(`車両${vehicles.length}台をクラウド保存しました。`);
-  }
-
-  setCloudBusy(false);
-};
-
- const addVehicle = () => {
-  alert("登録ボタンが押されました");
-
-  if (!form.office || !form.number) {
-    alert("営業所と車番は必須です");
-    return;
-  }
-
- const newVehicle: Vehicle = {
-  id: Date.now(),
-  office: form.office,
-  number: form.number,
-  driver: form.driver,
-  status: form.status,
-  storageLocation: form.storageLocation,
-  inspection: form.inspection,
-  insurance: form.insurance,
-  maker: form.maker,
-  model: form.model,
-  chassisNumber: form.chassisNumber,
-  firstRegistration: form.firstRegistration,
-  userName: form.userName,
-  ownerName: form.ownerName,
-};
-  setVehicles([...vehicles, newVehicle]);
-
-  setForm({
-  office: "",
-  number: "",
-  driver: "",
-  status: "保管中",
-  storageLocation: "",
-  inspection: "",
-  insurance: "",
-  maker: "",
-  model: "",
-  chassisNumber: "",
-  firstRegistration: "",
-  userName: "",
-  ownerName: "",
-});
-};
-
-const deleteVehicle = (id: number) => {
-    if (!confirm("削除しますか？")) return;
-
-    setVehicles(vehicles.filter((v) => v.id !== id));
+    return "";
   };
-const dateValue = (date: string) => {
-  const value = Date.parse(date);
-  return Number.isNaN(value) ? Number.MAX_SAFE_INTEGER : value;
-};
 
-const sortedVehicles = [...vehicles].sort((a, b) => {
-  if (sortOrder === "inspection") {
-    return dateValue(a.inspection) - dateValue(b.inspection);
-  }
+  // =========================
+  // 今月リース料
+  // =========================
 
-  if (sortOrder === "insurance") {
-    return dateValue(a.insurance) - dateValue(b.insurance);
-  }
+  const getCurrentLeaseFee = (
+    vehicle: Vehicle
+  ) => {
+    const status =
+      vehicle.status || "保管中";
 
-  if (sortOrder === "office") {
-    return a.office.localeCompare(b.office, "ja");
-  }
+    // 通常の貸出中以外は売上0円
+    if (status !== "貸出中") {
+      return 0;
+    }
 
-  return 0;
-});
-const getDateColor = (date: string) => {
-  if (!date) return "";
+    // 貸出開始前なら0円
+    if (vehicle.leaseStartDate) {
+      const startMonth =
+        vehicle.leaseStartDate.slice(0, 7);
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+      if (currentMonthKey < startMonth) {
+        return 0;
+      }
+    }
 
-  const targetDate = new Date(date);
-  targetDate.setHours(0, 0, 0, 0);
+    // 今月だけ特別料金が設定されている場合
+    const override =
+      vehicle.leaseFeeOverrides?.[
+        currentMonthKey
+      ];
 
-  const daysLeft = Math.ceil(
-    (targetDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
-  );
+    if (typeof override === "number") {
+      return override;
+    }
 
-  if (daysLeft <= 7) return "bg-red-200 text-red-800 font-bold";
-  if (daysLeft <= 14) return "bg-orange-200 text-orange-800 font-bold";
-  if (daysLeft <= 30) return "bg-yellow-200 text-yellow-800 font-bold";
+    // 通常月額
+    return (
+      vehicle.monthlyLeaseFee ??
+      DEFAULT_LEASE_FEE
+    );
+  };
 
-  return "";
-};
+  // =========================
+  // ステータス色
+  // =========================
+
+  const getStatusColor = (
+    status: VehicleStatus
+  ) => {
+    if (status === "貸出中") {
+      return "bg-green-500";
+    }
+
+    if (status === "代車貸出中") {
+      return "bg-orange-500";
+    }
+
+    if (status === "保管中") {
+      return "bg-blue-500";
+    }
+
+    return "bg-gray-500";
+  };
+
   return (
     <main className="p-6">
-      <h1 className="text-2xl font-bold mb-6">車両管理</h1>
+      <h1 className="text-2xl font-bold mb-6">
+        車両管理
+      </h1>
 
+      {/* クラウド */}
       <div className="mb-6 rounded-xl border border-blue-200 bg-blue-50 p-4">
         <div className="flex flex-wrap items-center gap-3">
           <span className="font-bold">
@@ -346,7 +583,9 @@ const getDateColor = (date: string) => {
           </button>
 
           <span className="text-sm font-semibold text-blue-800">
-            {session ? "管理者ログイン中" : "管理者ログインが必要です"}
+            {session
+              ? "管理者ログイン中"
+              : "管理者ログインが必要です"}
           </span>
         </div>
 
@@ -357,239 +596,355 @@ const getDateColor = (date: string) => {
         )}
       </div>
 
+      {/* 新規登録 */}
       <div
-  className="grid gap-3 mb-6"
-  style={{
-    gridTemplateColumns:
-      "repeat(3, minmax(0, 1fr))",
-  }}
->
-<select
-  className="border p-2 rounded"
-  value={form.office}
-  onChange={(e) =>
-    setForm({
-      ...form,
-      office: e.target.value,
-      driver: "",
-    })
-  }
->
-  <option value="">営業所選択</option>
-
-  {OFFICES.map((office) => (
-    <option key={office} value={office}>
-      {office}
-    </option>
-  ))}
-</select>
-
-<input
-  className="border p-2 rounded"
-  placeholder="車番"
-  value={form.number}
-  onChange={(e) =>
-    setForm({
-      ...form,
-      number: e.target.value,
-    })
-  }
-/>
-       <select
-  className="border p-2 rounded"
-  value={form.status}
-  onChange={(e) =>
-    setForm({
-      ...form,
-      status: e.target.value as Vehicle["status"],
-    })
-  }
->
-  <option value="貸出中">貸出中</option>
-  <option value="保管中">保管中</option>
-  <option value="廃車">廃車</option>
-</select>
-
-
-<select
-  className="border p-2 rounded"
-  value={form.driver}
-  onChange={(e) =>
-    setForm({
-      ...form,
-      driver: e.target.value,
-    })
-  }
->
-  <option value="">担当者選択</option>
-
-  {(DRIVERS_BY_OFFICE[form.office] || []).map((driver) => (
-    <option key={driver} value={driver}>
-      {driver}
-    </option>
-  ))}
-</select>
-<div>
-  <label className="text-sm font-semibold">🚗 車検日</label>
-
-  <input
-    type="date"
-    className="border p-2 rounded w-full"
-    value={form.inspection}
-    onChange={(e) =>
-      setForm({
-        ...form,
-        inspection: e.target.value,
-      })
-    }
-  />
-</div>
-        <div>
-  <label className="text-sm font-semibold">🛡️ 保険期限</label>
-  <input
-    type="date"
-    className="border p-2 rounded w-full"
-    value={form.insurance}
-    onChange={(e) =>
-      setForm({
-        ...form,
-        insurance: e.target.value,
-      })
-    }
-  />
-</div>
-
-       
-
-        <button
-  type="button"
-  onClick={addVehicle}
-  className="col-span-2 md:col-span-4 bg-blue-600 text-white rounded px-4 py-3 cursor-pointer"
->
-  登録
-</button>
-
-      </div>
-<div className="mb-4 flex justify-end">
-  <select
-    value={sortOrder}
-    onChange={(e) => setSortOrder(e.target.value)}
-    className="border rounded p-2"
-  >
-    <option value="registered">登録順</option>
-    <option value="inspection">車検が近い順</option>
-    <option value="insurance">保険期限が近い順</option>
-    <option value="office">営業所順</option>
-  </select>
-</div>
-      <table className="w-full table-fixed border-collapse border">
-       <colgroup>
-  <col className="w-[11%]" />
-  <col className="w-[18%]" />
-  <col className="w-[12%]" />
-  <col className="w-[11%]" />
-  <col className="w-[13%]" />
-  <col className="w-[13%]" />
-  <col className="w-[22%]" />
-</colgroup>
-  <thead>
-    <tr className="bg-gray-100">
-      <th className="border p-2">営業所</th>
-      <th className="border p-2">車番</th>
-      <th className="border p-2">ドライバー名</th>
-      <th className="border p-2">貸出状況</th>
-      
-      <th className="border p-2">車検</th>
-      <th className="border p-2">保険期限</th>
-      <th className="border p-2">操作</th>
-    </tr>
-  </thead>
-
-  <tbody>
-    {sortedVehicles.map((v) => {
-      const vehicleStatus = v.status || "保管中";
-
-      return (
-        <tr
-          key={v.id}
-          className={
-            vehicleStatus === "廃車"
-              ? "bg-gray-300 text-gray-600"
-              : ""
+        className="grid gap-3 mb-6"
+        style={{
+          gridTemplateColumns:
+            "repeat(3, minmax(0, 1fr))",
+        }}
+      >
+        <select
+          className="border p-2 rounded"
+          value={form.office}
+          onChange={(e) =>
+            setForm({
+              ...form,
+              office: e.target.value,
+              driver: "",
+            })
           }
         >
-          <td className="border p-2 text-center">
-  {v.office.replace("営業所", "")}
-</td>
-          <td className="border p-2">{v.number}</td>
-          <td className="border p-2 text-center">
-  {v.driver}
-</td>
+          <option value="">
+            営業所選択
+          </option>
 
-          <td className="border p-2 text-center">
-            <span
-              className={`inline-block rounded px-3 py-1 text-white font-bold ${
-                vehicleStatus === "貸出中"
-                  ? "bg-green-500"
-                  : vehicleStatus === "保管中"
-                    ? "bg-blue-500"
-                    : "bg-gray-500"
-              }`}
+          {OFFICES.map((office) => (
+            <option
+              key={office}
+              value={office}
             >
-              {vehicleStatus}
-            </span>
-          </td>
+              {office}
+            </option>
+          ))}
+        </select>
 
-          <td
-            className={`border p-2 text-center ${
-              vehicleStatus === "廃車"
-                ? ""
-                : getDateColor(v.inspection)
-            }`}
-          >
-            {v.inspection}
-          </td>
+        <input
+          className="border p-2 rounded"
+          placeholder="車番"
+          value={form.number}
+          onChange={(e) =>
+            setForm({
+              ...form,
+              number: e.target.value,
+            })
+          }
+        />
 
-          <td
-            className={`border p-2 text-center ${
-              vehicleStatus === "廃車"
-                ? ""
-                : getDateColor(v.insurance)
-            }`}
-          >
-            {v.insurance}
-          </td>
+        <select
+          className="border p-2 rounded"
+          value={form.status}
+          onChange={(e) =>
+            setForm({
+              ...form,
+              status:
+                e.target.value as VehicleStatus,
+            })
+          }
+        >
+          <option value="貸出中">
+            貸出中
+          </option>
 
-          <td className="border p-2">
-            <div className="flex justify-center gap-2 whitespace-nowrap">
-              <Link
-                href={`/vehicles/${v.id}`}
-                className="bg-blue-500 text-white rounded px-3 py-1"
-              >
-                詳細
-              </Link>
+          <option value="代車貸出中">
+            代車貸出中
+          </option>
 
-              <Link
-                href={`/vehicles/${v.id}/edit`}
-                className="bg-yellow-400 text-black rounded px-3 py-1"
-              >
-                修正
-              </Link>
+          <option value="保管中">
+            保管中
+          </option>
 
-              <button
-                type="button"
-                onClick={() => deleteVehicle(v.id)}
-                className="bg-red-500 text-white rounded px-3 py-1"
-              >
-                削除
-              </button>
-            </div>
-          </td>
-        </tr>
-      );
-    })}
-  </tbody>
-</table>
-</main>
+          <option value="廃車">
+            廃車
+          </option>
+        </select>
+
+        <select
+          className="border p-2 rounded"
+          value={form.driver}
+          onChange={(e) =>
+            setForm({
+              ...form,
+              driver: e.target.value,
+            })
+          }
+        >
+          <option value="">
+            担当者選択
+          </option>
+
+          {(
+            DRIVERS_BY_OFFICE[
+              form.office
+            ] || []
+          ).map((driver) => (
+            <option
+              key={driver}
+              value={driver}
+            >
+              {driver}
+            </option>
+          ))}
+        </select>
+
+        <div>
+          <label className="text-sm font-semibold">
+            🚗 車検日
+          </label>
+
+          <input
+            type="date"
+            className="border p-2 rounded w-full"
+            value={form.inspection}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                inspection:
+                  e.target.value,
+              })
+            }
+          />
+        </div>
+
+        <div>
+          <label className="text-sm font-semibold">
+            🛡️ 保険期限
+          </label>
+
+          <input
+            type="date"
+            className="border p-2 rounded w-full"
+            value={form.insurance}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                insurance:
+                  e.target.value,
+              })
+            }
+          />
+        </div>
+
+        <button
+          type="button"
+          onClick={addVehicle}
+          className="col-span-2 md:col-span-4 bg-blue-600 text-white rounded px-4 py-3 cursor-pointer"
+        >
+          登録
+        </button>
+      </div>
+
+      {/* 並び替え */}
+      <div className="mb-4 flex justify-end">
+        <select
+          value={sortOrder}
+          onChange={(e) =>
+            setSortOrder(e.target.value)
+          }
+          className="border rounded p-2"
+        >
+          <option value="registered">
+            登録順
+          </option>
+
+          <option value="inspection">
+            車検が近い順
+          </option>
+
+          <option value="insurance">
+            保険期限が近い順
+          </option>
+
+          <option value="office">
+            営業所順
+          </option>
+        </select>
+      </div>
+
+      {/* 車両一覧 */}
+      <div className="overflow-x-auto">
+        <table className="w-full table-fixed border-collapse border">
+          <colgroup>
+            <col className="w-[10%]" />
+            <col className="w-[15%]" />
+            <col className="w-[12%]" />
+            <col className="w-[14%]" />
+            <col className="w-[11%]" />
+            <col className="w-[12%]" />
+            <col className="w-[12%]" />
+            <col className="w-[20%]" />
+          </colgroup>
+
+          <thead>
+            <tr className="bg-gray-100">
+              <th className="border p-2">
+                営業所
+              </th>
+
+              <th className="border p-2">
+                車番
+              </th>
+
+              <th className="border p-2">
+                ドライバー名
+              </th>
+
+              <th className="border p-2">
+                貸出状況
+              </th>
+
+              <th className="border p-2">
+                今月リース
+              </th>
+
+              <th className="border p-2">
+                車検
+              </th>
+
+              <th className="border p-2">
+                保険期限
+              </th>
+
+              <th className="border p-2">
+                操作
+              </th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {sortedVehicles.map((v) => {
+              const vehicleStatus =
+                v.status || "保管中";
+
+              const currentLeaseFee =
+                getCurrentLeaseFee(v);
+
+              return (
+                <tr
+                  key={v.id}
+                  className={
+                    vehicleStatus ===
+                    "廃車"
+                      ? "bg-gray-300 text-gray-600"
+                      : ""
+                  }
+                >
+                  <td className="border p-2 text-center">
+                    {v.office.replace(
+                      "営業所",
+                      ""
+                    )}
+                  </td>
+
+                  <td className="border p-2">
+                    {v.number}
+                  </td>
+
+                  <td className="border p-2 text-center">
+                    {v.driver}
+                  </td>
+
+                  <td className="border p-2 text-center">
+                    <span
+                      className={`inline-block rounded px-3 py-1 text-white font-bold ${getStatusColor(
+                        vehicleStatus
+                      )}`}
+                    >
+                      {vehicleStatus}
+                    </span>
+                  </td>
+
+                  <td className="border p-2 text-center">
+                    {vehicleStatus ===
+                    "貸出中" ? (
+                      <span className="font-bold">
+                        ¥
+                        {currentLeaseFee.toLocaleString()}
+                      </span>
+                    ) : vehicleStatus ===
+                      "代車貸出中" ? (
+                      <span className="text-gray-500 font-semibold">
+                        ¥0
+                      </span>
+                    ) : (
+                      <span className="text-gray-400">
+                        -
+                      </span>
+                    )}
+                  </td>
+
+                  <td
+                    className={`border p-2 text-center ${
+                      vehicleStatus ===
+                      "廃車"
+                        ? ""
+                        : getDateColor(
+                            v.inspection
+                          )
+                    }`}
+                  >
+                    {v.inspection}
+                  </td>
+
+                  <td
+                    className={`border p-2 text-center ${
+                      vehicleStatus ===
+                      "廃車"
+                        ? ""
+                        : getDateColor(
+                            v.insurance
+                          )
+                    }`}
+                  >
+                    {v.insurance}
+                  </td>
+
+                  {/* 操作ボタンは今まで通り */}
+                  <td className="border p-2">
+                    <div className="flex justify-center gap-2 whitespace-nowrap">
+                      <Link
+                        href={`/vehicles/${v.id}`}
+                        className="bg-blue-500 text-white rounded px-3 py-1"
+                      >
+                        詳細
+                      </Link>
+
+                      <Link
+                        href={`/vehicles/${v.id}/edit`}
+                        className="bg-yellow-400 text-black rounded px-3 py-1"
+                      >
+                        修正
+                      </Link>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          deleteVehicle(
+                            v.id
+                          )
+                        }
+                        className="bg-red-500 text-white rounded px-3 py-1"
+                      >
+                        削除
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </main>
   );
 }

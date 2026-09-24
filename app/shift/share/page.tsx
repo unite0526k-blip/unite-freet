@@ -15,6 +15,22 @@ type Driver = {
   fixedHoliday?: number;
 };
 
+type CloudDriver = {
+  name?: string;
+  office?: string;
+  area?: string;
+  mainOffice?: string;
+  mainArea?: string;
+  subOffice?: string;
+  subOffices?: string[];
+  status?: string;
+};
+
+type CloudRosterItem = {
+  driver: Driver;
+  offices: OfficeName[];
+};
+
 type Region = "松阪" | "伊勢" | "伊賀";
 type SavedCourse = {
   id: number;
@@ -31,6 +47,33 @@ type PersonalAssignment = {
 };
 
 const REGIONS: Region[] = ["松阪", "伊勢", "伊賀"];
+
+const toOfficeName = (value: unknown): OfficeName | undefined => {
+  const normalized = String(value ?? "").replace(/営業所$/, "");
+  if (normalized === "松阪") return "松阪営業所";
+  if (normalized === "伊勢") return "伊勢営業所";
+  if (normalized === "伊賀") return "伊賀営業所";
+  return undefined;
+};
+
+const getCloudDriverOffices = (driver: CloudDriver): OfficeName[] => {
+  const values = [
+    driver.office,
+    driver.area,
+    driver.mainOffice,
+    driver.mainArea,
+    driver.subOffice,
+    ...(Array.isArray(driver.subOffices) ? driver.subOffices : []),
+  ];
+
+  return Array.from(
+    new Set(
+      values
+        .map(toOfficeName)
+        .filter((value): value is OfficeName => Boolean(value)),
+    ),
+  );
+};
 
 function getPersonalAssignments(
   driverName: string,
@@ -180,6 +223,7 @@ const [month, setMonth] = useState(() => {
   const [viewMode, setViewMode] = useState<ViewMode>("personal");
   const [selectedDay, setSelectedDay] = useState(12);
   const [shiftsByDate, setShiftsByDate] = useState<ShiftsByDate>({});
+  const [cloudRoster, setCloudRoster] = useState<CloudRosterItem[]>([]);
   const [cloudLoading, setCloudLoading] = useState(true);
   const [cloudMessage, setCloudMessage] = useState("");
   const [currentPin, setCurrentPin] = useState("");
@@ -187,6 +231,64 @@ const [month, setMonth] = useState(() => {
   const [confirmPin, setConfirmPin] = useState("");
   const [pinMessage, setPinMessage] = useState("");
   const [pinChanging, setPinChanging] = useState(false);
+
+  // ドライバー管理（fleet_master）だけを正本として共有画面の名簿を更新する。
+  // 過去シフトや古い設定に残った名前は、正式名簿へ混ぜない。
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCloudRoster = async () => {
+      const masterResult = await supabase
+        .from("fleet_master")
+        .select("drivers")
+        .eq("id", "default")
+        .maybeSingle();
+
+      if (cancelled) return;
+
+      const roster = new Map<
+        string,
+        { driver: Driver; offices: Set<OfficeName> }
+      >();
+
+      const addDriver = (name: string, offices: OfficeName[]) => {
+        const trimmedName = String(name ?? "").trim();
+        if (!trimmedName) return;
+
+        const key = normalizeName(trimmedName);
+        const existing = roster.get(key) ?? {
+          driver: { name: trimmedName },
+          offices: new Set<OfficeName>(),
+        };
+
+        offices.forEach((targetOffice) => existing.offices.add(targetOffice));
+        roster.set(key, existing);
+      };
+
+      const masterDrivers = Array.isArray(masterResult.data?.drivers)
+        ? (masterResult.data.drivers as CloudDriver[])
+        : [];
+
+      masterDrivers
+        .filter((driver) => driver.status !== "退職")
+        .forEach((driver) => {
+          if (!driver.name) return;
+          addDriver(driver.name, getCloudDriverOffices(driver));
+        });
+
+      setCloudRoster(
+        Array.from(roster.values()).map((item) => ({
+          driver: item.driver,
+          offices: Array.from(item.offices),
+        })),
+      );
+    };
+
+    void loadCloudRoster();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -249,47 +351,45 @@ const [month, setMonth] = useState(() => {
   const officeData = OFFICE_DATA[office];
   const region = office.replace("営業所", "") as Region;
 
+  const officeDrivers = useMemo(() => {
+    const cloudDrivers = cloudRoster
+      .filter((item) => item.offices.includes(office))
+      .map((item) => item.driver);
+
+    if (cloudDrivers.length === 0) return officeData.drivers;
+
+    // 固定休など、旧名簿にだけある表示用情報は引き継ぐ。
+    return cloudDrivers.map((driver) => {
+      const fallback = officeData.drivers.find(
+        (item) => normalizeName(item.name) === normalizeName(driver.name),
+      );
+      return fallback ? { ...fallback, name: driver.name } : driver;
+    });
+  }, [cloudRoster, office, officeData.drivers]);
+
   const displayDrivers = useMemo(() => {
     const byName = new Map<string, Driver>();
-    officeData.drivers.forEach((driver) =>
+    officeDrivers.forEach((driver) =>
       byName.set(normalizeName(driver.name), driver),
     );
-    Object.entries(shiftsByDate)
-      .filter(([date]) => date.startsWith(`${month}-`))
-      .forEach(([, regions]) => {
-        (regions[region] ?? []).forEach((course) => {
-          if (!course.driver) return;
-          const key = normalizeName(course.driver);
-          if (!byName.has(key)) byName.set(key, { name: course.driver });
-        });
-      });
     return Array.from(byName.values());
-  }, [month, officeData.drivers, region, shiftsByDate]);
+  }, [officeDrivers]);
 
   const allDrivers = useMemo(() => {
     const byName = new Map<string, Driver>();
 
-    Object.values(OFFICE_DATA).forEach((data) => {
-      data.drivers.forEach((driver) => {
+    const rosterDrivers =
+      cloudRoster.length > 0
+        ? cloudRoster.map((item) => item.driver)
+        : Object.values(OFFICE_DATA).flatMap((data) => data.drivers);
+
+    rosterDrivers.forEach((driver) => {
         const key = normalizeName(driver.name);
         if (!byName.has(key)) byName.set(key, driver);
-      });
     });
 
-    Object.entries(shiftsByDate)
-      .filter(([date]) => date.startsWith(`${month}-`))
-      .forEach(([, regions]) => {
-        REGIONS.forEach((targetRegion) => {
-          (regions[targetRegion] ?? []).forEach((course) => {
-            if (!course.driver) return;
-            const key = normalizeName(course.driver);
-            if (!byName.has(key)) byName.set(key, { name: course.driver });
-          });
-        });
-      });
-
     return Array.from(byName.values());
-  }, [month, shiftsByDate]);
+  }, [cloudRoster]);
 
   const selectedDriver =
     allDrivers.find(
@@ -811,7 +911,7 @@ const [month, setMonth] = useState(() => {
         )}
         <DayOffRequest />
         <p className="mt-6 text-right text-xs text-slate-500">
-          最終更新：2026年8月14日
+          シフトデータ：クラウド同期済み
         </p>
       </div>
     </main>
