@@ -99,6 +99,9 @@ function getPersonalAssignments(
 }
 
 const normalizeName = (value: string) => value.replace(/[\s　]/g, "");
+
+// shift_driver_settings に残っている、現在のドライバー管理には存在しない旧名。
+const HIDDEN_LEGACY_DRIVER_NAMES = new Set(["伊藤圭", "小倉"]);
 const dateKey = (date: Date) => {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -226,23 +229,30 @@ const [month, setMonth] = useState(() => {
   const [cloudRoster, setCloudRoster] = useState<CloudRosterItem[]>([]);
   const [cloudLoading, setCloudLoading] = useState(true);
   const [cloudMessage, setCloudMessage] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
   const [currentPin, setCurrentPin] = useState("");
   const [newPin, setNewPin] = useState("");
   const [confirmPin, setConfirmPin] = useState("");
   const [pinMessage, setPinMessage] = useState("");
   const [pinChanging, setPinChanging] = useState(false);
 
-  // ドライバー管理（fleet_master）だけを正本として共有画面の名簿を更新する。
-  // 過去シフトや古い設定に残った名前は、正式名簿へ混ぜない。
+  // 公開スマホでは fleet_master が RLS で読めない場合があるため、
+  // 管理画面が保存する shift_driver_settings も名簿の同期元にする。
+  // 過去シフトの担当者名は混ぜない（旧名・略称が復活するのを防ぐ）。
   useEffect(() => {
     let cancelled = false;
 
     const loadCloudRoster = async () => {
-      const masterResult = await supabase
-        .from("fleet_master")
-        .select("drivers")
-        .eq("id", "default")
-        .maybeSingle();
+      const [masterResult, settingsResult] = await Promise.all([
+        supabase
+          .from("fleet_master")
+          .select("drivers")
+          .eq("id", "default")
+          .maybeSingle(),
+        supabase
+          .from("shift_driver_settings")
+          .select("driver_name,office"),
+      ]);
 
       if (cancelled) return;
 
@@ -276,8 +286,32 @@ const [month, setMonth] = useState(() => {
           addDriver(driver.name, getCloudDriverOffices(driver));
         });
 
+      // 設定画面で追加・更新された最新ドライバーを公開画面にも反映する。
+      // 同名は normalizeName で統合されるため二重表示されない。
+      (settingsResult.data ?? []).forEach((setting) => {
+        const settingOffice = toOfficeName(setting.office);
+        addDriver(
+          String(setting.driver_name ?? ""),
+          settingOffice ? [settingOffice] : [],
+        );
+      });
+
+      // 旧設定に「小倉」と「小倉 祐司」のような短縮名が残っている場合は、
+      // より長い正式名を優先して短縮名を表示しない。
+      const rosterEntries = Array.from(roster.entries());
+      const currentRoster = rosterEntries.filter(([key]) => {
+        if (HIDDEN_LEGACY_DRIVER_NAMES.has(key)) return false;
+        if (key.length < 2) return true;
+        return !rosterEntries.some(
+          ([otherKey]) =>
+            otherKey !== key &&
+            otherKey.length > key.length &&
+            otherKey.startsWith(key),
+        );
+      });
+
       setCloudRoster(
-        Array.from(roster.values()).map((item) => ({
+        currentRoster.map(([, item]) => ({
           driver: item.driver,
           offices: Array.from(item.offices),
         })),
@@ -297,7 +331,7 @@ const [month, setMonth] = useState(() => {
       setCloudMessage("");
       const { data: monthRow, error: monthError } = await supabase
         .from("shift_months")
-        .select("id")
+        .select("id,published_at")
         .eq("month_key", month)
         .eq("status", "published")
         .maybeSingle();
@@ -316,7 +350,8 @@ const [month, setMonth] = useState(() => {
         .from("shift_assignments")
         .select("work_date,area,course,driver_name,status")
         .eq("shift_month_id", monthRow.id)
-        .order("work_date");
+        .order("work_date")
+        .range(0, 4999);
       if (cancelled) return;
       if (error) {
         setShiftsByDate({});
@@ -338,13 +373,30 @@ const [month, setMonth] = useState(() => {
         });
       });
       setShiftsByDate(loaded);
+      setCloudMessage(
+        `公開シフトを更新しました（${assignments?.length ?? 0}件・${
+          monthRow.published_at
+            ? new Date(monthRow.published_at).toLocaleString("ja-JP")
+            : "公開日時不明"
+        }公開）。`,
+      );
       setCloudLoading(false);
     };
     refresh();
     return () => {
       cancelled = true;
     };
-  }, [month]);
+  }, [month, refreshKey]);
+
+  useEffect(() => {
+    const refreshOnReturn = () => {
+      if (document.visibilityState === "visible") {
+        setRefreshKey((previous) => previous + 1);
+      }
+    };
+    document.addEventListener("visibilitychange", refreshOnReturn);
+    return () => document.removeEventListener("visibilitychange", refreshOnReturn);
+  }, []);
 
   const [year, monthNumber] = month.split("-").map(Number);
 
@@ -569,6 +621,14 @@ const [month, setMonth] = useState(() => {
           </div>
 
           <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={() => setRefreshKey((previous) => previous + 1)}
+              disabled={cloudLoading}
+              className="min-h-11 rounded-xl border border-blue-300 bg-white px-4 font-semibold text-blue-900 disabled:opacity-50"
+            >
+              最新の公開シフトを表示
+            </button>
             <select
               value={office}
               onChange={(event) =>

@@ -54,6 +54,7 @@ type ShiftDriverSettingRow = {
   driver_name: string;
   office: string;
   available_courses?: string[];
+  course_priorities?: Array<{ office: string; course: string }>;
   auto_assign?: boolean;
 };
 
@@ -276,13 +277,18 @@ const getSupportedCoursesForRegion = (
   >,
   region: Region,
 ) => {
-  // 営業所別の登録があれば、それだけを正として使う。
+  // メイン営業所は、現行の営業所別登録と旧形式の登録を合算する。
+  // 営業所別に空配列が残っていても、旧形式側に保存済みの担当コースを
+  // 手動変更画面で「未登録」と誤判定しないようにする。
   const byOffice = driver.supportedCoursesByOffice?.[region];
-  if (byOffice !== undefined) return byOffice;
+  if (driver.mainArea === region) {
+    return Array.from(
+      new Set([...(byOffice ?? []), ...(driver.supportedCourses ?? [])]),
+    );
+  }
 
-  // 旧データ互換は「メイン営業所だけ」。
-  // サブ営業所に登録されているだけでは配置可能にしない。
-  if (driver.mainArea === region) return driver.supportedCourses ?? [];
+  // サブ営業所は営業所別に明示登録されたコースだけを使う。
+  if (byOffice !== undefined) return byOffice;
 
   return [];
 };
@@ -301,12 +307,12 @@ const fixedCourseMatches = (
   courseName: string,
 ) => {
   if (!fixedCourse) return true;
-  if (fixedCourse === courseName) return true;
+  if (sameCourseName(fixedCourse, courseName)) return true;
 
   // 伊勢の日曜「神久・朝熊コース」は、神久固定の東さんを配置可能にする。
   if (
-    fixedCourse === "神久コース" &&
-    courseName === "神久・朝熊コース"
+    normalizeCourseName(fixedCourse) === "神久" &&
+    normalizeCourseName(courseName) === "神久・朝熊"
   ) {
     return true;
   }
@@ -461,15 +467,48 @@ export default function ShiftPage() {
   const targetKey = (monthKey: string, region: Region, driverName: string) =>
     `${monthKey}|${region}|${driverName}`;
 
+  // 氏名の半角・全角スペースが編集前後で変わっても、既に入力した301を失わない。
+  const findTargetWorkDaysValue = (
+    monthKey: string,
+    region: Region,
+    driverName: string,
+  ) => {
+    const direct = targetWorkDays[targetKey(monthKey, region, driverName)];
+    if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+
+    const normalizedName = normalizeDriverName(driverName);
+    const prefix = `${monthKey}|${region}|`;
+    for (const [key, value] of Object.entries(targetWorkDays)) {
+      if (!key.startsWith(prefix)) continue;
+      if (
+        normalizeDriverName(key.slice(prefix.length)) === normalizedName &&
+        typeof value === "number" &&
+        Number.isFinite(value)
+      ) {
+        return value;
+      }
+    }
+    return undefined;
+  };
+
   const getTargetWorkDays = (
     monthKey: string,
     region: Region,
     driverName: string,
   ) => {
-    const value = targetWorkDays[targetKey(monthKey, region, driverName)];
+    const value = findTargetWorkDaysValue(monthKey, region, driverName);
     return typeof value === "number" && Number.isFinite(value)
       ? Math.max(0, Math.floor(value))
       : undefined;
+  };
+
+  const hasTargetWorkDays = (
+    monthKey: string,
+    region: Region,
+    driverName: string,
+  ) => {
+    const value = findTargetWorkDaysValue(monthKey, region, driverName);
+    return typeof value === "number" && Number.isFinite(value);
   };
 
   const getMonthlyRequiredCourseCount = (region: Region) => {
@@ -594,7 +633,9 @@ export default function ShiftPage() {
           .maybeSingle(),
         supabase
           .from("shift_driver_settings")
-          .select("driver_name,office,available_courses,auto_assign"),
+          .select(
+            "driver_name,office,available_courses,course_priorities,auto_assign",
+          ),
       ]);
       if (!data) return;
       const cloudDrivers = data.drivers as StoredDriver[];
@@ -614,8 +655,16 @@ export default function ShiftPage() {
       // shift_driver_settings に古い名前が残っていても、新しいドライバーとして追加しない。
       const normalizeName = (value: string) => value.replace(/[\s　]/g, "");
       const mergedDrivers = [...(cloudDrivers ?? [])];
+      const typedShiftSettingRows = (shiftSettingRows ?? []) as ShiftDriverSettingRow[];
+      // 同じ人の古い行（auto_assign=false）が残っていても、現在の行で
+      // 1件でもチェック済みなら自動振り分け対象として扱う。
+      const autoAssignEnabledNames = new Set(
+        typedShiftSettingRows
+          .filter((setting) => setting.auto_assign !== false)
+          .map((setting) => normalizeName(setting.driver_name)),
+      );
 
-      ((shiftSettingRows ?? []) as ShiftDriverSettingRow[]).forEach((setting) => {
+      typedShiftSettingRows.forEach((setting) => {
         const existingIndex = mergedDrivers.findIndex(
           (driver) =>
             normalizeName(driver.name) === normalizeName(setting.driver_name),
@@ -644,6 +693,21 @@ export default function ShiftPage() {
           {} as Partial<Record<Region, string[]>>,
         );
 
+        const priorityCoursesByOffice = (
+          setting.course_priorities ?? []
+        ).reduce(
+          (acc, priority) => {
+            const region = normalizeRegion(priority.office);
+            const course = normalizeCourseName(priority.course);
+            if (!region || !course) return acc;
+            acc[region] = Array.from(
+              new Set([...(acc[region] ?? []), course]),
+            );
+            return acc;
+          },
+          {} as Partial<Record<Region, string[]>>,
+        );
+
         mergedDrivers[existingIndex] = {
           ...mergedDrivers[existingIndex],
           supportedCourses:
@@ -660,11 +724,29 @@ export default function ShiftPage() {
               ? { [settingOffice]: supportedCourses }
               : {}),
             ...qualifiedByOffice,
+            ...Object.fromEntries(
+              Object.entries(priorityCoursesByOffice).map(
+                ([region, courses]) => [
+                  region,
+                  Array.from(
+                    new Set([
+                      ...((mergedDrivers[existingIndex]
+                        .supportedCoursesByOffice?.[region as Region] ?? []) as string[]),
+                      ...((qualifiedByOffice[region as Region] ?? []) as string[]),
+                      ...((courses ?? []) as string[]),
+                    ]),
+                  ),
+                ],
+              ),
+            ),
           },
-          assignmentMode:
-            setting.auto_assign === false
-              ? "自動除外"
-              : mergedDrivers[existingIndex].assignmentMode ?? "通常",
+          assignmentMode: autoAssignEnabledNames.has(
+            normalizeName(setting.driver_name),
+          )
+            ? mergedDrivers[existingIndex].assignmentMode === "自動除外"
+              ? "通常"
+              : mergedDrivers[existingIndex].assignmentMode ?? "通常"
+            : "自動除外",
         };
       });
 
@@ -981,52 +1063,55 @@ export default function ShiftPage() {
       .eq("target_month", autoMonth);
 
     if (dayOffError) {
-          const { data: priorityRows, error: priorityError } = await supabase
-      .from("shift_driver_settings")
-      .select("driver_name,course_priorities");
-
-    if (priorityError) {
-      setAutoMessage(
-        `コース優先順位の読込エラー：${priorityError.message}`
-      );
-      return;
-    }
       setAutoMessage(`希望休の読込エラー：${dayOffError.message}`);
       return;
     }
     const { data: priorityRows, error: priorityError } =
-  await supabase
-    .from("shift_driver_settings")
-    .select("driver_name, course_priorities");
+      await supabase
+        .from("shift_driver_settings")
+        .select("driver_name, course_priorities");
 
-if (priorityError) {
-  setAutoMessage(
-    `コース優先順位の読込エラー：${priorityError.message}`
-  );
-  return;
-}
+    if (priorityError) {
+      setAutoMessage(
+        `コース優先順位の読込エラー：${priorityError.message}`,
+      );
+      return;
+    }
     const coursePriorityMap = new Map<
-  string,
-  Array<{ office: string; course: string }>
->();
+      string,
+      Array<{ office: string; course: string }>
+    >();
 
-(priorityRows ?? []).forEach(
-  (row: {
-    driver_name: string;
-    course_priorities: unknown;
-  }) => {
-    const priorities = (
-      Array.isArray(row.course_priorities)
-        ? row.course_priorities
-        : []
-    ) as Array<{ office: string; course: string }>;
+    (priorityRows ?? []).forEach(
+      (row: {
+        driver_name: string;
+        course_priorities: unknown;
+      }) => {
+        const priorities = (
+          Array.isArray(row.course_priorities)
+            ? row.course_priorities
+            : []
+        ) as Array<{ office: string; course: string }>;
+        const name = normalizeDriverName(row.driver_name);
+        const existing = coursePriorityMap.get(name) ?? [];
 
-    coursePriorityMap.set(
-      normalizeDriverName(row.driver_name),
-      priorities
+        // 同名の古い設定行が残っていても、後の空配列で現在の優先コースを
+        // 消さない。営業所とコースの組み合わせで統合する。
+        coursePriorityMap.set(
+          name,
+          [...existing, ...priorities].filter(
+            (priority, index, all) =>
+              index ===
+              all.findIndex(
+                (item) =>
+                  normalizeRegion(item.office) ===
+                    normalizeRegion(priority.office) &&
+                  sameCourseName(item.course, priority.course),
+              ),
+          ),
+        );
+      },
     );
-  }
-);
     const uniqueDrivers = Array.from(
       new Map(standbyDrivers.map((driver) => [driver.name, driver])).values(),
     );
@@ -1092,6 +1177,20 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
         courseName,
       );
     };
+    // 担当可能コースの保存形式が旧形式・営業所別・優先順位のどれでも、
+    // 自動作成では同じ担当可能コースとして認識する。
+    const canHandleCourseForGeneration = (
+      driver: DriverItem,
+      region: Region,
+      courseName: string,
+    ) => {
+      if (canDriverHandleCourse(driver, region, courseName)) return true;
+      const priorities = configuredCoursesForRegion(driver.name, region);
+      return canDriveCourse(
+        priorities.map((priority) => priority.course),
+        courseName,
+      );
+    };
     const requiredCourseCountByRegion = new Map<Region, number>(
       (["松阪", "伊勢", "伊賀"] as Region[]).map((region) => [
         region,
@@ -1138,11 +1237,30 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
         generationTargetKey(region, driverName),
       ) ?? 0;
 
+    const hasGenerationTargetWorkDays = (
+      region: Region,
+      driverName: string,
+    ) => hasTargetWorkDays(autoMonth, region, driverName);
+
     const getGenerationTotalTarget = (driverName: string) =>
       regionsForGeneration.reduce(
         (sum, region) =>
           sum + getGenerationTargetWorkDays(region, driverName),
         0,
+      );
+
+    const hasAnyExplicitGenerationTarget = (driverName: string) =>
+      regionsForGeneration.some((region) =>
+        hasGenerationTargetWorkDays(region, driverName),
+      );
+
+    // 301で正の出勤日数が明示されている人は、その月については
+    // 古い「自動除外」情報より301を優先する。
+    const isAutoExcludedForGeneration = (driver: DriverItem) =>
+      driver.assignmentMode === "自動除外" &&
+      !(
+        hasAnyExplicitGenerationTarget(driver.name) &&
+        getGenerationTotalTarget(driver.name) > 0
       );
 
     const autoSupportMoves: Array<{
@@ -1189,14 +1307,20 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
               if (mainRegion === targetRegion) return false;
               if (!getDriverOfficeTabs(driver).includes(targetRegion))
                 return false;
-              if (driver.assignmentMode === "自動除外") return false;
+              if (isAutoExcludedForGeneration(driver)) return false;
+              // 301に0日を含む日数が明示されている営業所は、
+              // 自動応援によって指定値を上書きしない。
+              if (
+                hasGenerationTargetWorkDays(targetRegion, driver.name)
+              )
+                return false;
               if (getGenerationTotalTarget(driver.name) >= softCap)
                 return false;
 
               // 登録されている担当可能コースで、実際の月間コースを
               // 1つ以上担当できる人だけ応援候補にする。
               return Array.from(monthlyCourses).some((courseName) =>
-                canDriverHandleCourse(driver, targetRegion, courseName),
+                canHandleCourseForGeneration(driver, targetRegion, courseName),
               );
             })
             .sort((a, b) => {
@@ -1209,7 +1333,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
               // 対応できるコースが多い人を優先。
               const coverage = (driver: DriverItem) =>
                 Array.from(monthlyCourses).filter((courseName) =>
-                  canDriverHandleCourse(driver, targetRegion, courseName),
+                  canHandleCourseForGeneration(driver, targetRegion, courseName),
                 ).length;
               const coverageDiff = coverage(b) - coverage(a);
               if (coverageDiff !== 0) return coverageDiff;
@@ -1447,7 +1571,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
 
     const shouldBalanceDriver = (driver: DriverItem) => {
       if (
-        driver.assignmentMode === "自動除外" ||
+        isAutoExcludedForGeneration(driver) ||
         driver.assignmentMode === "最終候補"
       ) {
         return false;
@@ -1541,7 +1665,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
           uniqueDrivers.filter((driver) => {
             if (!eligibleRegions.get(driver.name)?.has(region)) return false;
             if (
-              driver.assignmentMode === "自動除外" &&
+              isAutoExcludedForGeneration(driver) &&
               normalizeDriverName(driver.name) !==
                 normalizeDriverName("清水 國光")
             )
@@ -1553,7 +1677,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
               return false;
             // メイン/サブ営業所に属しているだけでは不可。
             // この営業所の「このコース」が担当可能として登録済みの人だけ候補にする。
-            if (!canDriverHandleCourse(driver, region, course.course))
+            if (!canHandleCourseForGeneration(driver, region, course.course))
               return false;
             if (!isConfiguredCourse(driver.name, region, course.course))
               return false;
@@ -1561,6 +1685,21 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
               return false;
             if (assignedToday.has(driver.name)) return false;
             if (requestedOff(driver.name, day, weekday)) return false;
+            // 全営業所合計の301が明示入力で0日の人は配置しない。
+            if (
+              hasAnyExplicitGenerationTarget(driver.name) &&
+              getGenerationTotalTarget(driver.name) === 0
+            )
+              return false;
+            // 明示された営業所別301は、完成判定に関係なく上限として厳守する。
+            if (hasGenerationTargetWorkDays(region, driver.name)) {
+              const target = getGenerationTargetWorkDays(region, driver.name);
+              const currentRegionalCount =
+                regionalWorkCounts.get(
+                  regionalCountKey(region, driver.name),
+                ) ?? 0;
+              if (currentRegionalCount >= target) return false;
+            }
             if (targetPlanCompleteByRegion.get(region)) {
               const target = getGenerationTargetWorkDays(
                 region,
@@ -1620,7 +1759,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
             const unavailableReasons = (driver: DriverItem) => {
               const reasons: string[] = [];
               if (
-                driver.assignmentMode === "自動除外" &&
+                isAutoExcludedForGeneration(driver) &&
                 normalizeDriverName(driver.name) !==
                   normalizeDriverName("清水 國光")
               )
@@ -1630,7 +1769,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
                 driver.mainArea === region
               )
                 reasons.push("応援先限定");
-              if (!canDriverHandleCourse(driver, region, course.course))
+              if (!canHandleCourseForGeneration(driver, region, course.course))
                 reasons.push("対応コース外");
               if (!isConfiguredCourse(driver.name, region, course.course))
                 reasons.push("優先コース外");
@@ -1640,6 +1779,23 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
                 reasons.push("別コース配置済み");
               if (requestedOff(driver.name, day, weekday))
                 reasons.push("希望・固定休");
+              if (
+                hasAnyExplicitGenerationTarget(driver.name) &&
+                getGenerationTotalTarget(driver.name) === 0
+              )
+                reasons.push("301指定0日");
+              if (hasGenerationTargetWorkDays(region, driver.name)) {
+                const target = getGenerationTargetWorkDays(
+                  region,
+                  driver.name,
+                );
+                const currentRegionalCount =
+                  regionalWorkCounts.get(
+                    regionalCountKey(region, driver.name),
+                  ) ?? 0;
+                if (currentRegionalCount >= target)
+                  reasons.push("301指定出勤日数到達");
+              }
               if (targetPlanCompleteByRegion.get(region)) {
                 const target = getGenerationTargetWorkDays(
                               region,
@@ -1838,6 +1994,44 @@ const coursePriorityPenalty =
                             urgency * 12000
                           );
                         })();
+                  // 残りの勤務可能日をすべて使わないと301へ届かない人は、
+                  // その日の担当可能コースへ最優先で配置する。
+                  const targetMustWorkPriority =
+                    targetDaysForRegion === undefined
+                      ? 0
+                      : (() => {
+                          const currentRegionalCount =
+                            regionalWorkCounts.get(
+                              regionalCountKey(region, driver.name),
+                            ) ?? 0;
+                          const remainingTarget = Math.max(
+                            0,
+                            targetDaysForRegion - currentRegionalCount,
+                          );
+                          let remainingAvailableDays = 0;
+                          for (
+                            let futureDay = day;
+                            futureDay <= lastDay;
+                            futureDay += 1
+                          ) {
+                            const futureWeekday = new Date(
+                              year,
+                              month - 1,
+                              futureDay,
+                            ).getDay();
+                            if (
+                              !requestedOff(
+                                driver.name,
+                                futureDay,
+                                futureWeekday,
+                              )
+                            )
+                              remainingAvailableDays += 1;
+                          }
+                          return remainingTarget >= remainingAvailableDays
+                            ? -100000
+                            : 0;
+                        })();
                   // 「月8休み」「週2休み」などの休日数指定がある人を
                   // 月初に使い切らないよう、出勤可能日数を月全体へ配分する。
                   const maximumWorkDays =
@@ -1867,6 +2061,7 @@ const coursePriorityPenalty =
                     supportOfficePenalty +
                     fairnessPenalty +
                     targetPacingPenalty +
+                    targetMustWorkPriority +
                     monthlyPacingPenalty +
                     variationScore(
                       driver.name,
@@ -1966,12 +2161,17 @@ const coursePriorityPenalty =
         ignoreNames: Set<string> = new Set(),
       ) => {
         if (
+          hasAnyExplicitGenerationTarget(driver.name) &&
+          getGenerationTotalTarget(driver.name) === 0
+        )
+          return false;
+        if (
           assignedNames.has(driver.name) &&
           !ignoreNames.has(driver.name)
         )
           return false;
         if (requestedOff(driver.name, day, weekday)) return false;
-        if (!canDriverHandleCourse(driver, region, courseName)) return false;
+        if (!canHandleCourseForGeneration(driver, region, courseName)) return false;
         if (!isConfiguredCourse(driver.name, region, courseName)) return false;
         if (!fixedCourseMatches(driver.fixedCourse, courseName)) return false;
 
@@ -1994,6 +2194,15 @@ const coursePriorityPenalty =
           !ignoreNames.has(driver.name)
         )
           return false;
+
+        if (hasGenerationTargetWorkDays(region, driver.name)) {
+          const target = getGenerationTargetWorkDays(region, driver.name);
+          const actual =
+            regionalWorkCounts.get(
+              regionalCountKey(region, driver.name),
+            ) ?? 0;
+          if (actual >= target && !ignoreNames.has(driver.name)) return false;
+        }
 
         if (targetPlanCompleteByRegion.get(region)) {
           const target =
@@ -2324,7 +2533,7 @@ const coursePriorityPenalty =
 
         if (!eligibleRegions.get(driver.name)?.has(region)) return false;
         if (
-          driver.assignmentMode === "自動除外" &&
+          isAutoExcludedForGeneration(driver) &&
           normalizeDriverName(driver.name) !==
             normalizeDriverName("清水 國光")
         )
@@ -2335,7 +2544,7 @@ const coursePriorityPenalty =
         )
           return false;
         if (requestedOff(driver.name, day, weekday)) return false;
-        if (!canDriverHandleCourse(driver, region, courseName)) return false;
+        if (!canHandleCourseForGeneration(driver, region, courseName)) return false;
         if (!isConfiguredCourse(driver.name, region, courseName)) return false;
         if (!fixedCourseMatches(driver.fixedCourse, courseName)) return false;
 
@@ -2877,9 +3086,14 @@ const coursePriorityPenalty =
             const candidates = uniqueDrivers
               .filter((driver) => {
                 if (normalizeDriverName(driver.name) === kunimitsuName) return false;
-                if (driver.assignmentMode === "自動除外") return false;
+                if (isAutoExcludedForGeneration(driver)) return false;
+                if (
+                  hasAnyExplicitGenerationTarget(driver.name) &&
+                  getGenerationTotalTarget(driver.name) === 0
+                )
+                  return false;
                 if (!eligibleRegions.get(driver.name)?.has(region)) return false;
-                if (!canDriverHandleCourse(driver, region, currentCourse.course)) return false;
+                if (!canHandleCourseForGeneration(driver, region, currentCourse.course)) return false;
                 if (!isConfiguredCourse(driver.name, region, currentCourse.course)) return false;
                 if (!fixedCourseMatches(driver.fixedCourse, currentCourse.course)) return false;
                 if (requestedOff(driver.name, day, weekday)) return false;
@@ -2895,6 +3109,26 @@ const coursePriorityPenalty =
                 if (alreadyAssignedToday) return false;
 
                 const actualDays = countActualWorkedDates(driver.name).size;
+                if (hasGenerationTargetWorkDays(region, driver.name)) {
+                  let actualRegionalDays = 0;
+                  for (let d = 1; d <= lastDay; d += 1) {
+                    const key = `${autoMonth}-${String(d).padStart(2, "0")}`;
+                    if (
+                      (generated[key]?.[region] ?? []).some(
+                        (item) =>
+                          item.driver &&
+                          normalizeDriverName(item.driver) ===
+                            normalizeDriverName(driver.name),
+                      )
+                    )
+                      actualRegionalDays += 1;
+                  }
+                  if (
+                    actualRegionalDays >=
+                    getGenerationTargetWorkDays(region, driver.name)
+                  )
+                    return false;
+                }
                 const maximum = parsedConditions.get(driver.name)?.maximumWorkDays;
                 const desired = maximum ?? 24;
                 if (actualDays >= desired) return false;
@@ -2928,6 +3162,359 @@ const coursePriorityPenalty =
 
           if (generated[dateKey]) generated[dateKey][region] = dayCourses;
         }
+      }
+
+      // 最終安全装置：後段の均等化・修復処理を通った後でも、
+      // 301で「その営業所を0日」にした人が残っていれば必ず未配置へ戻す。
+      // 全営業所合計が0日の人だけでなく、例えば「伊勢は勤務するが松阪は0日」
+      // の人が応援・交換処理で松阪へ戻されることも防ぐ。
+      Object.values(generated).forEach((dayShifts) => {
+        (Object.entries(dayShifts) as Array<[Region, Course[]]>).forEach(
+          ([region, dayCourses]) => {
+          dayCourses.forEach((course) => {
+            if (!course.driver) return;
+            if (
+              (hasAnyExplicitGenerationTarget(course.driver) &&
+                getGenerationTotalTarget(course.driver) === 0) ||
+              (hasGenerationTargetWorkDays(region, course.driver) &&
+                getGenerationTargetWorkDays(region, course.driver) === 0)
+            ) {
+              course.driver = "";
+              course.status = "未配車";
+              course.memo = `301指定：${region}0日のため配置除外`;
+            }
+          });
+          },
+        );
+      });
+
+      // 最終別日交換：301合計は変えずに未配置を埋める。
+      // Aを別日から未配置日へ移し、Aが抜けた日を301不足者Bへ渡す。
+      const finalRegionalCount = (region: Region, driverName: string) => {
+        let count = 0;
+        for (let d = 1; d <= lastDay; d += 1) {
+          const key = `${autoMonth}-${String(d).padStart(2, "0")}`;
+          if (
+            (generated[key]?.[region] ?? []).some(
+              (item) =>
+                item.driver &&
+                normalizeDriverName(item.driver) ===
+                  normalizeDriverName(driverName),
+            )
+          )
+            count += 1;
+        }
+        return count;
+      };
+
+      const canFinalPlace = (
+        driver: DriverItem,
+        region: Region,
+        courseName: string,
+        dateKey: string,
+        removeDateKey?: string,
+      ) => {
+        if (
+          hasAnyExplicitGenerationTarget(driver.name) &&
+          getGenerationTotalTarget(driver.name) === 0
+        )
+          return false;
+        if (
+          hasGenerationTargetWorkDays(region, driver.name) &&
+          getGenerationTargetWorkDays(region, driver.name) === 0
+        )
+          return false;
+        const day = Number(dateKey.slice(-2));
+        const weekday = new Date(`${dateKey}T00:00:00`).getDay();
+        if (requestedOff(driver.name, day, weekday)) return false;
+        if (!eligibleRegions.get(driver.name)?.has(region)) return false;
+        if (!canHandleCourseForGeneration(driver, region, courseName)) return false;
+        if (!isConfiguredCourse(driver.name, region, courseName)) return false;
+        if (!fixedCourseMatches(driver.fixedCourse, courseName)) return false;
+        if (driver.name === "東 真規" && weekday === 1) return false;
+        if (driver.name === "中川 昭治" && weekday === 4) return false;
+        if (
+          driver.name === "東 真規" &&
+          courseName !== "神久コース" &&
+          courseName !== "神久・朝熊コース"
+        )
+          return false;
+        if (driver.name === "中川 昭治" && courseName !== "Hコース")
+          return false;
+        if (
+          driverWorksOnGeneratedDate(driver.name, dateKey) &&
+          dateKey !== removeDateKey
+        )
+          return false;
+        if (
+          wouldCreateSevenDayStreakAfterMove(
+            driver.name,
+            dateKey,
+            removeDateKey,
+          )
+        )
+          return false;
+        return true;
+      };
+
+      // 301不足者が「担当できるコースは埋まっているが、別コースが未配置」
+      // という理由で0日のまま残るケースを解消する。
+      // 例：小林さんはFのみ担当可能。F担当者を同日の未配置コースへ移し、
+      // 空いたFへ小林さんを入れる。希望休・固定休・7連勤・担当可能コースは維持する。
+      for (let rebalancePass = 0; rebalancePass < lastDay; rebalancePass += 1) {
+        let rebalancedInPass = 0;
+
+        for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+          const underTargetDrivers = uniqueDrivers
+            .filter((driver) => {
+              if (!hasGenerationTargetWorkDays(region, driver.name))
+                return false;
+              const target = getGenerationTargetWorkDays(region, driver.name);
+              return target > finalRegionalCount(region, driver.name);
+            })
+            .sort(
+              (a, b) =>
+                getGenerationTargetWorkDays(region, b.name) -
+                finalRegionalCount(region, b.name) -
+                (getGenerationTargetWorkDays(region, a.name) -
+                  finalRegionalCount(region, a.name)),
+            );
+
+          for (const candidate of underTargetDrivers) {
+            const target = getGenerationTargetWorkDays(region, candidate.name);
+
+            for (
+              let day = 1;
+              day <= lastDay &&
+              finalRegionalCount(region, candidate.name) < target;
+              day += 1
+            ) {
+              const dateKey = `${autoMonth}-${String(day).padStart(2, "0")}`;
+              if (driverWorksOnGeneratedDate(candidate.name, dateKey)) continue;
+
+              const dayCourses = generated[dateKey]?.[region] ?? [];
+              let placed = false;
+
+              for (
+                let occupiedIndex = 0;
+                occupiedIndex < dayCourses.length && !placed;
+                occupiedIndex += 1
+              ) {
+                const occupiedCourse = dayCourses[occupiedIndex];
+                if (!occupiedCourse.driver || occupiedCourse.isLocked) continue;
+                if (
+                  !canFinalPlace(
+                    candidate,
+                    region,
+                    occupiedCourse.course,
+                    dateKey,
+                  )
+                )
+                  continue;
+
+                const currentDriver = findDriver(occupiedCourse.driver);
+                if (!currentDriver) continue;
+
+                // 同じ日の未配置コースを現担当者が担当できれば、
+                // 出勤日数を減らさず1段移動して301不足者の枠を作る。
+                const missingIndex = dayCourses.findIndex(
+                  (otherCourse, otherIndex) =>
+                    otherIndex !== occupiedIndex &&
+                    !otherCourse.driver &&
+                    !otherCourse.isLocked &&
+                    canFinalPlace(
+                      currentDriver,
+                      region,
+                      otherCourse.course,
+                      dateKey,
+                      dateKey,
+                    ),
+                );
+
+                if (missingIndex >= 0) {
+                  const missingCourse = dayCourses[missingIndex];
+                  dayCourses[missingIndex] = {
+                    ...missingCourse,
+                    driver: currentDriver.name,
+                    status: "配車済" as const,
+                    memo: "301不足解消：同日コース移動",
+                  };
+                  dayCourses[occupiedIndex] = {
+                    ...occupiedCourse,
+                    driver: candidate.name,
+                    status: "配車済" as const,
+                    memo: "301不足解消：担当可能コースへ配置",
+                  };
+                  generated[dateKey][region] = dayCourses;
+                  rebalancedInPass += 1;
+                  placed = true;
+                  continue;
+                }
+
+                // 未配置コースがない日は、301を超過している人とのみ交代する。
+                // これにより営業所全体の配置数を変えず目標差を縮める。
+                if (
+                  hasGenerationTargetWorkDays(region, currentDriver.name) &&
+                  finalRegionalCount(region, currentDriver.name) >
+                    getGenerationTargetWorkDays(region, currentDriver.name)
+                ) {
+                  dayCourses[occupiedIndex] = {
+                    ...occupiedCourse,
+                    driver: candidate.name,
+                    status: "配車済" as const,
+                    memo: "301不足解消：超過者と交代",
+                  };
+                  generated[dateKey][region] = dayCourses;
+                  rebalancedInPass += 1;
+                  placed = true;
+                }
+              }
+            }
+          }
+        }
+
+        if (rebalancedInPass === 0) break;
+      }
+
+      // まず、301でその営業所の日数が不足している人を未配車へ直接補充する。
+      // 必要数と301合計が一致している場合は、これで単純な取りこぼしを回収できる。
+      for (let fillPass = 0; fillPass < 4; fillPass += 1) {
+        let filledInPass = 0;
+        for (let day = 1; day <= lastDay; day += 1) {
+          const dateKey = `${autoMonth}-${String(day).padStart(2, "0")}`;
+          for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+            const dayCourses = generated[dateKey]?.[region] ?? [];
+            dayCourses.forEach((course, courseIndex) => {
+              if (course.driver || course.isLocked) return;
+              const candidates = uniqueDrivers
+                .filter((candidate) => {
+                  if (!hasGenerationTargetWorkDays(region, candidate.name))
+                    return false;
+                  if (
+                    finalRegionalCount(region, candidate.name) >=
+                    getGenerationTargetWorkDays(region, candidate.name)
+                  )
+                    return false;
+                  return canFinalPlace(
+                    candidate,
+                    region,
+                    course.course,
+                    dateKey,
+                  );
+                })
+                .sort((a, b) => {
+                  const shortageA =
+                    getGenerationTargetWorkDays(region, a.name) -
+                    finalRegionalCount(region, a.name);
+                  const shortageB =
+                    getGenerationTargetWorkDays(region, b.name) -
+                    finalRegionalCount(region, b.name);
+                  return shortageB - shortageA;
+                });
+              const selected = candidates[0];
+              if (!selected) return;
+              dayCourses[courseIndex] = {
+                ...course,
+                driver: selected.name,
+                status: "配車済" as const,
+                memo: "301不足分を最終補充",
+              };
+              generated[dateKey][region] = dayCourses;
+              filledInPass += 1;
+            });
+          }
+        }
+        if (filledInPass === 0) break;
+      }
+
+      for (let finalPass = 0; finalPass < 6; finalPass += 1) {
+        let fixedInPass = 0;
+        for (let missingDay = 1; missingDay <= lastDay; missingDay += 1) {
+          const missingDate = `${autoMonth}-${String(missingDay).padStart(2, "0")}`;
+          for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+            const missingCourses = generated[missingDate]?.[region] ?? [];
+            for (
+              let missingIndex = 0;
+              missingIndex < missingCourses.length;
+              missingIndex += 1
+            ) {
+              const missingCourse = missingCourses[missingIndex];
+              if (missingCourse.driver || missingCourse.isLocked) continue;
+
+              let solved = false;
+              for (let donorDay = 1; donorDay <= lastDay && !solved; donorDay += 1) {
+                const donorDate = `${autoMonth}-${String(donorDay).padStart(2, "0")}`;
+                if (donorDate === missingDate) continue;
+                const donorCourses = generated[donorDate]?.[region] ?? [];
+
+                for (
+                  let donorIndex = 0;
+                  donorIndex < donorCourses.length && !solved;
+                  donorIndex += 1
+                ) {
+                  const donorCourse = donorCourses[donorIndex];
+                  if (!donorCourse.driver || donorCourse.isLocked) continue;
+                  const mover = findDriver(donorCourse.driver);
+                  if (!mover) continue;
+                  if (
+                    !canFinalPlace(
+                      mover,
+                      region,
+                      missingCourse.course,
+                      missingDate,
+                      donorDate,
+                    )
+                  )
+                    continue;
+
+                  const replacement = uniqueDrivers.find((candidate) => {
+                    if (
+                      normalizeDriverName(candidate.name) ===
+                      normalizeDriverName(mover.name)
+                    )
+                      return false;
+                    if (
+                      !canFinalPlace(
+                        candidate,
+                        region,
+                        donorCourse.course,
+                        donorDate,
+                      )
+                    )
+                      return false;
+                    if (hasGenerationTargetWorkDays(region, candidate.name)) {
+                      return (
+                        finalRegionalCount(region, candidate.name) <
+                        getGenerationTargetWorkDays(region, candidate.name)
+                      );
+                    }
+                    return false;
+                  });
+
+                  if (!replacement) continue;
+
+                  missingCourses[missingIndex] = {
+                    ...missingCourse,
+                    driver: mover.name,
+                    status: "配車済" as const,
+                    memo: "301維持：最終別日交換",
+                  };
+                  donorCourses[donorIndex] = {
+                    ...donorCourse,
+                    driver: replacement.name,
+                    status: "配車済" as const,
+                    memo: "301維持：最終別日交換",
+                  };
+                  generated[missingDate][region] = missingCourses;
+                  generated[donorDate][region] = donorCourses;
+                  fixedInPass += 1;
+                  solved = true;
+                }
+              }
+            }
+          }
+        }
+        if (fixedInPass === 0) break;
       }
 
       // 上の置換後の実績を採点へ正しく反映する。
@@ -3041,7 +3628,7 @@ const coursePriorityPenalty =
             dayCourses.some(
               (course) =>
                 eligibleRegions.get(driver.name)?.has(region) &&
-                canDriverHandleCourse(driver, region, course.course) &&
+                canHandleCourseForGeneration(driver, region, course.course) &&
                 isConfiguredCourse(driver.name, region, course.course) &&
                 (!driver.fixedCourse ||
                   driver.fixedCourse === course.course),
@@ -3181,6 +3768,39 @@ const coursePriorityPenalty =
     if (bestSevenDayStreakCount > 0)
       warnings.push(`7連勤以上が${bestSevenDayStreakCount}件`);
 
+    const selectedTargetShortages: string[] = [];
+    (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
+      uniqueDrivers.forEach((driver) => {
+        if (!hasGenerationTargetWorkDays(region, driver.name)) return;
+        const target = getGenerationTargetWorkDays(region, driver.name);
+        let actual = 0;
+        for (let day = 1; day <= lastDay; day += 1) {
+          const dateKey = `${autoMonth}-${String(day).padStart(2, "0")}`;
+          if (
+            (selectedGenerated[dateKey]?.[region] ?? []).some(
+              (course) =>
+                course.driver &&
+                normalizeDriverName(course.driver) ===
+                  normalizeDriverName(driver.name),
+            )
+          )
+            actual += 1;
+        }
+        if (actual < target) {
+          selectedTargetShortages.push(
+            `${driver.name}（${region}${actual}/${target}日）`,
+          );
+        }
+      });
+    });
+    if (selectedTargetShortages.length > 0) {
+      warnings.push(
+        `301未達：${selectedTargetShortages.slice(0, 5).join("、")}${
+          selectedTargetShortages.length > 5 ? "ほか" : ""
+        }`,
+      );
+    }
+
     const supportSummary = autoSupportMoves.length
       ? ` 自動応援：${autoSupportMoves
           .map(
@@ -3224,7 +3844,7 @@ const changeMonthlyCourseDriver = async (
 ) => {
   const selectedDriver = standbyDrivers.find(
     (driver) =>
-      driver.name === driverName &&
+      normalizeDriverName(driver.name) === normalizeDriverName(driverName) &&
       driver.area.replace("営業所", "") === region,
   );
   const targetCourse = (
@@ -3805,13 +4425,31 @@ const monthlyCourseNames = uniqueCourseNames(
     setCloudMessage("");
     const cloudMonthKey = canonicalMonthKey(autoMonth);
     const nextStatus = publish ? "published" : "draft";
+    const rows = Object.keys(shiftsByDate)
+      .filter((date) => date.startsWith(`${cloudMonthKey}-`))
+      .flatMap((date) =>
+        (Object.keys(shiftsByDate[date]) as Region[]).flatMap((region) =>
+          shiftsByDate[date][region].map((course) => ({
+            work_date: date,
+            area: region,
+            course: course.course,
+            driver_name: course.driver,
+            status: course.status,
+            memo: course.memo,
+            is_locked: course.isLocked,
+          })),
+        ),
+      );
+    if (rows.length === 0) {
+      setCloudBusy(false);
+      setCloudMessage("保存対象のシフトがありません。画面の対象月を確認してください。");
+      return;
+    }
     const { data: monthRow, error: monthError } = await supabase
       .from("shift_months")
       .upsert(
         {
           month_key: cloudMonthKey,
-          status: nextStatus,
-          published_at: publish ? new Date().toISOString() : null,
           created_by: session.user.id,
         },
         { onConflict: "month_key" },
@@ -3825,22 +4463,20 @@ const monthlyCourseNames = uniqueCourseNames(
       );
       return;
     }
-    const rows = Object.keys(shiftsByDate)
-      .filter((date) => date.startsWith(`${cloudMonthKey}-`))
-      .flatMap((date) =>
-        (Object.keys(shiftsByDate[date]) as Region[]).flatMap((region) =>
-          shiftsByDate[date][region].map((course) => ({
-            shift_month_id: monthRow.id,
-            work_date: date,
-            area: region,
-            course: course.course,
-            driver_name: course.driver,
-            status: course.status,
-            memo: course.memo,
-            is_locked: course.isLocked,
-          })),
-        ),
-      );
+    // 入替中の配置をスマホへ公開しない。照合完了後にだけ再公開する。
+    const { error: stagingError } = await supabase
+      .from("shift_months")
+      .update({ status: "draft", published_at: null })
+      .eq("id", monthRow.id);
+    if (stagingError) {
+      setCloudBusy(false);
+      setCloudMessage(`保存準備エラー：${stagingError.message}`);
+      return;
+    }
+    const assignmentRows = rows.map((row) => ({
+      ...row,
+      shift_month_id: monthRow.id,
+    }));
     const conditionRows = Object.entries(requestedDaysOff)
       .filter(([, text]) => text.trim())
       .map(([driverName, text]) => ({
@@ -3848,15 +4484,6 @@ const monthlyCourseNames = uniqueCourseNames(
         driver_name: driverName,
         condition_text: text,
       }));
-    // 安全装置：管理画面が空の状態ではクラウド既存シフトを削除しない
-    if (rows.length === 0) {
-      setCloudBusy(false);
-      setCloudMessage(
-        "保存を中止しました。現在の管理画面に保存対象シフトが0件のため、クラウドの既存データは削除していません。",
-      );
-      return;
-    }
-
     const { error: deleteAssignmentError } = await supabase
       .from("shift_assignments")
       .delete()
@@ -3865,8 +4492,8 @@ const monthlyCourseNames = uniqueCourseNames(
       .from("shift_conditions")
       .delete()
       .eq("shift_month_id", monthRow.id);
-    const { error: assignmentError } = rows.length
-      ? await supabase.from("shift_assignments").insert(rows)
+    const { error: assignmentError } = assignmentRows.length
+      ? await supabase.from("shift_assignments").insert(assignmentRows)
       : { error: null };
     const { error: conditionError } = conditionRows.length
       ? await supabase.from("shift_conditions").insert(conditionRows)
@@ -3876,14 +4503,52 @@ const monthlyCourseNames = uniqueCourseNames(
       deleteConditionError ||
       assignmentError ||
       conditionError;
-    if (!error)
-      await supabase.from("shift_history").insert({
-        shift_month_id: monthRow.id,
-        action: publish ? "published" : "saved_draft",
-        changed_by: session.user.id,
-      });
+    if (error) {
+      setCloudBusy(false);
+      return setCloudMessage(`保存エラー：${error.message}。公開状態は更新していません。`);
+    }
+
+    // 保存した全行を読み直し、管理画面と完全一致した時だけ公開する。
+    const { data: savedRows, error: verifyError } = await supabase
+      .from("shift_assignments")
+      .select("work_date,area,course,driver_name,status,memo,is_locked")
+      .eq("shift_month_id", monthRow.id)
+      .range(0, Math.max(rows.length, 1000));
+    const rowKey = (row: (typeof rows)[number]) =>
+      [row.work_date, row.area, row.course, row.driver_name ?? "", row.status,
+        row.memo ?? "", String(Boolean(row.is_locked))].join("|");
+    const expected = rows.map(rowKey).sort();
+    const actual = (savedRows ?? []).map((row) =>
+      rowKey({
+        work_date: String(row.work_date).slice(0, 10),
+        area: row.area,
+        course: row.course,
+        driver_name: row.driver_name,
+        status: row.status,
+        memo: row.memo,
+        is_locked: row.is_locked,
+      }),
+    ).sort();
+    if (verifyError || expected.length !== actual.length ||
+        expected.some((value, index) => value !== actual[index])) {
+      setCloudBusy(false);
+      setCloudMessage("公開を中止しました。クラウドの配置と管理画面が一致しません。再度保存してください。");
+      return;
+    }
+    const { error: statusError } = await supabase
+      .from("shift_months")
+      .update({
+        status: nextStatus,
+        published_at: publish ? new Date().toISOString() : null,
+      })
+      .eq("id", monthRow.id);
     setCloudBusy(false);
-    if (error) return setCloudMessage(`保存エラー：${error.message}`);
+    if (statusError) return setCloudMessage(`公開状態の更新エラー：${statusError.message}`);
+    await supabase.from("shift_history").insert({
+      shift_month_id: monthRow.id,
+      action: publish ? "published" : "saved_draft",
+      changed_by: session.user.id,
+    });
     setMonthStatus(nextStatus);
     setCloudMessage(
       publish
