@@ -209,7 +209,7 @@ const [month, setMonth] = useState(() => {
       setRosterLoading(true);
       setRosterError("");
       try {
-        const { data, error } = await supabase.rpc("get_public_shift_roster");
+        const { data, error } = await supabase.rpc("get_public_shift_roster_for_month", { target_month: month });
         if (error) throw error;
         if (!Array.isArray(data)) throw new Error("名簿の形式が正しくありません。");
         const roster = new Map<string, CloudRosterItem>();
@@ -236,7 +236,7 @@ const [month, setMonth] = useState(() => {
     };
     void loadCloudRoster();
     return () => { cancelled = true; };
-  }, [refreshKey]);
+  }, [month, refreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -317,9 +317,29 @@ const [month, setMonth] = useState(() => {
   const officeData = OFFICE_DATA[office];
   const region = office.replace("営業所", "") as Region;
 
-  const officeDrivers = useMemo(() => cloudRoster
+  // 保存済みの配置に残っている人は、退職・名簿削除後も履歴に表示する。
+  const historicalRoster = useMemo(() => {
+    const byName = new Map<string, CloudRosterItem>();
+    cloudRoster.forEach((item) => byName.set(normalizeName(item.driver.name), { ...item, offices: [...item.offices] }));
+    Object.entries(shiftsByDate).forEach(([date, areas]) => {
+      if (!date.startsWith(`${month}-`)) return;
+      (Object.entries(areas) as [Region, SavedCourse[]][]).forEach(([area, courses]) => {
+        courses.forEach((course) => {
+          if (!course.driver?.trim()) return;
+          const key = normalizeName(course.driver);
+          const item: CloudRosterItem = byName.get(key) ?? { driver: { name: course.driver }, offices: [] };
+          const assignedOffice = `${area}営業所` as OfficeName;
+          if (!item.offices.includes(assignedOffice)) item.offices.push(assignedOffice);
+          byName.set(key, item);
+        });
+      });
+    });
+    return Array.from(byName.values());
+  }, [cloudRoster, shiftsByDate, month]);
+
+  const officeDrivers = useMemo(() => historicalRoster
     .filter((item) => item.offices.includes(office))
-    .map((item) => item.driver), [cloudRoster, office]);
+    .map((item) => item.driver), [historicalRoster, office]);
 
   const displayDrivers = useMemo(() => {
     const byName = new Map<string, Driver>();
@@ -332,7 +352,7 @@ const [month, setMonth] = useState(() => {
   const allDrivers = useMemo(() => {
     const byName = new Map<string, Driver>();
 
-    const rosterDrivers = cloudRoster.map((item) => item.driver);
+    const rosterDrivers = historicalRoster.map((item) => item.driver);
 
     rosterDrivers.forEach((driver) => {
         const key = normalizeName(driver.name);
@@ -340,7 +360,7 @@ const [month, setMonth] = useState(() => {
     });
 
     return Array.from(byName.values());
-  }, [cloudRoster]);
+  }, [historicalRoster]);
 
   const selectedDriver =
     allDrivers.find(

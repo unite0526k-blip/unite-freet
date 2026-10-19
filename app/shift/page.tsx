@@ -31,6 +31,9 @@ type DriverItem = {
   area: string;
   status: "待機" | "稼働";
   mainArea?: string;
+  employmentStatus?: string;
+  startDate?: string;
+  retirementDate?: string;
   supportedCourses?: string[]; // 旧データ互換
   supportedCoursesByOffice?: Partial<Record<Region, string[]>>;
   fixedCourse?: string;
@@ -44,6 +47,8 @@ type StoredDriver = {
   subOffice?: string;
   subOffices?: string[];
   status: string;
+  startDate?: string;
+  retirementDate?: string;
   supportedCourses?: string[]; // 旧データ互換
   supportedCoursesByOffice?: Partial<Record<Region, string[]>>;
   fixedCourse?: string;
@@ -196,20 +201,8 @@ const resolveCourseNamesForDate = (
   preset: "normal" | "weekday",
   override?: string[],
 ) => {
-  const presetNames = getCourseNamesForDate(dateValue, region, preset);
-  if (!override) return presetNames;
-
-  const otherPreset = preset === "normal" ? "weekday" : "normal";
-  const oldPresetNames = getCourseNamesForDate(
-    dateValue,
-    region,
-    otherPreset,
-  );
-  const isOldAutomaticPattern =
-    override.join("|") === oldPresetNames.join("|") &&
-    override.join("|") !== presetNames.join("|");
-
-  return isOldAutomaticPattern ? presetNames : override;
+  // 日別に明示された構成は、曜日の既定パターンと同じでも保持する。
+  return override ?? getCourseNamesForDate(dateValue, region, preset);
 };
 
 const normalizeCourseName = (value: string) =>
@@ -219,6 +212,25 @@ const normalizeCourseName = (value: string) =>
 
 const sameCourseName = (left: string, right: string) =>
   normalizeCourseName(left) === normalizeCourseName(right);
+
+// 日別設定がない旧保存データでは、保存された結合構成を復元して照合する。
+// 通常日のデータ欠落は既定コースとの比較を維持して検出する。
+const requiredCoursesForSavedDay = (
+  date: string,
+  region: Region,
+  preset: "normal" | "weekday",
+  override: string[] | undefined,
+  courses: Course[],
+): string[] => {
+  if (override !== undefined) return override;
+  const mergedNames = region === "松阪"
+    ? ["AB", "BC", "CD"]
+    : region === "伊勢" ? ["神久・朝熊", "御薗・高向"] : [];
+  if (courses.some((course) => mergedNames.includes(normalizeCourseName(course.course)))) {
+    return courses.map((course) => course.course);
+  }
+  return resolveCourseNamesForDate(date, region, preset);
+};
 
 const uniqueCourseNames = (names: string[]) => {
   const result: string[] = [];
@@ -396,6 +408,19 @@ const statusStyles: Record<CourseStatus, string> = {
 // ドライバー名比較用：半角・全角スペースを無視する
 const normalizeDriverName = (value: string) => value.replace(/[\s　]/g, "");
 
+// 退職日は最終在籍日。保存済みの配置はこの判定で削除しない。
+const employmentDate = (value?: string) => {
+  const date = String(value ?? "").slice(0, 10).replace(/\//g, "-");
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
+};
+const employedDuring = (driver: DriverItem, from: string, to: string) => {
+  const start = employmentDate(driver.startDate);
+  const end = employmentDate(driver.retirementDate);
+  if (start && start > to) return false;
+  if (end) return end >= from;
+  return driver.employmentStatus !== "退職";
+};
+
 export default function ShiftPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [authEmail, setAuthEmail] = useState("");
@@ -417,6 +442,9 @@ export default function ShiftPage() {
   const [autoMonth, setAutoMonth] = useState(() =>
     formatDateKey(new Date()).slice(0, 7),
   );
+  const [searchMonth, setSearchMonth] = useState(autoMonth);
+  const [monthSearchMessage, setMonthSearchMessage] = useState("");
+  useEffect(() => { setSearchMonth(autoMonth); setSelectedWeek(0); }, [autoMonth]);
   const [requestedDaysOff, setRequestedDaysOff] = useState<RequestedDaysOff>(
     {},
   );
@@ -578,9 +606,12 @@ export default function ShiftPage() {
     }));
   };
 
-  const [standbyDrivers, setStandbyDrivers] = useState<DriverItem[]>(
+  const [masterDrivers, setMasterDrivers] = useState<DriverItem[]>(
     initialStandbyDrivers,
   );
+  const standbyDrivers = useMemo(() => masterDrivers.filter((driver) =>
+    employedDuring(driver, `${autoMonth}-01`, `${autoMonth}-31`)
+  ), [masterDrivers, autoMonth]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -756,9 +787,8 @@ export default function ShiftPage() {
       }
 
       if (mergedDrivers.length) {
-        setStandbyDrivers(
+        setMasterDrivers(
           mergedDrivers
-            .filter((driver) => driver.status !== "退職")
             .flatMap((driver) => {
             const offices = [
               driver.office,
@@ -772,6 +802,9 @@ export default function ShiftPage() {
               name: driver.name,
               area: office,
               status: "待機" as const,
+              employmentStatus: driver.status,
+              startDate: driver.startDate,
+              retirementDate: driver.retirementDate,
               mainArea: driver.office.replace("営業所", ""),
               supportedCourses: driver.supportedCourses ?? [],
               supportedCoursesByOffice:
@@ -1590,7 +1623,10 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
 
     const requestedOff = (name: string, day: number, weekday: number) => {
       const condition = parsedConditions.get(name);
+      const dateKey = `${autoMonth}-${String(day).padStart(2, "0")}`;
+      const driver = uniqueDrivers.find((item) => normalizeDriverName(item.name) === normalizeDriverName(name));
       return Boolean(
+        !driver || !employedDuring(driver, dateKey, dateKey) ||
                 registeredDaysOff
           .get(normalizeDriverName(name))
           ?.has(`${autoMonth}-${String(day).padStart(2, "0")}`) ||
@@ -3822,6 +3858,10 @@ const coursePriorityPenalty =
         driver.name === driverName &&
         driver.area.replace("営業所", "") === activeTab,
     );
+    if (selectedDriver && !employedDuring(selectedDriver, selectedDate, selectedDate)) {
+      alert("この日は在籍期間外です。");
+      return;
+    }
     setCoursesByRegion((previous) => ({
       ...previous,
       [activeTab]: previous[activeTab].map((course) =>
@@ -3847,6 +3887,10 @@ const changeMonthlyCourseDriver = async (
       normalizeDriverName(driver.name) === normalizeDriverName(driverName) &&
       driver.area.replace("営業所", "") === region,
   );
+  if (selectedDriver && !employedDuring(selectedDriver, dateKey, dateKey)) {
+    alert("この日は在籍期間外です。");
+    return;
+  }
   const targetCourse = (
   shiftsByDate[dateKey]?.[region] ?? []
 ).find((course) => course.id === courseId);
@@ -4147,16 +4191,16 @@ const monthlyCourseNames = uniqueCourseNames(
   };
 
   const canonicalMonthKey = (value: string) => {
-    const match = String(value ?? "").trim().match(/^(\\d{4})-(\\d{1,2})$/);
+    const match = String(value ?? "").trim().match(/^(\d{4})-(\d{1,2})$/);
     if (!match) return String(value ?? "").trim();
     return `${match[1]}-${match[2].padStart(2, "0")}`;
   };
 
-  const loadCloudMonth = async () => {
+  const loadCloudMonth = async (targetMonth: string = autoMonth) => {
     if (!session) return setCloudMessage("先に管理者ログインしてください。");
     setCloudBusy(true);
     setCloudMessage("");
-    const cloudMonthKey = canonicalMonthKey(autoMonth);
+    const cloudMonthKey = canonicalMonthKey(targetMonth);
 
     // 共有画面と同じ公開済み月を最優先で読む
     const { data: publishedMonth, error: publishedMonthError } = await supabase
@@ -4193,6 +4237,9 @@ const monthlyCourseNames = uniqueCourseNames(
     }
 
     if (!monthRow) {
+      setAutoMonth(cloudMonthKey);
+      setSelectedDate(`${cloudMonthKey}-01`);
+      setSelectedWeek(0);
       setCloudBusy(false);
       setMonthStatus("draft");
       setCloudMessage(`${cloudMonthKey}のクラウドデータはまだありません。`);
@@ -4207,7 +4254,8 @@ const monthlyCourseNames = uniqueCourseNames(
         .from("shift_assignments")
         .select("work_date,area,course,driver_name,status,memo,is_locked")
         .eq("shift_month_id", monthRow.id)
-        .order("work_date"),
+        .order("work_date")
+        .range(0, 4999),
       supabase
         .from("shift_conditions")
         .select("driver_name,condition_text")
@@ -4225,6 +4273,9 @@ const monthlyCourseNames = uniqueCourseNames(
     // 0件データで現在の管理画面を消さない
     if ((assignments ?? []).length === 0) {
       setCloudBusy(false);
+      setAutoMonth(cloudMonthKey);
+      setSelectedDate(`${cloudMonthKey}-01`);
+      setSelectedWeek(0);
       setMonthStatus(monthRow.status as "draft" | "published");
       setCloudMessage(
         `${cloudMonthKey}のクラウド月は見つかりましたが、配置データが0件です。現在の画面は保持しました。`,
@@ -4290,6 +4341,8 @@ const monthlyCourseNames = uniqueCourseNames(
       return { ...otherMonths, ...loadedOverrides };
     });
 
+    setAutoMonth(cloudMonthKey);
+    setSelectedWeek(0);
     setRequestedDaysOff((previous) => ({ ...previous, ...loadedConditions }));
     setMonthStatus(monthRow.status as "draft" | "published");
     setSelectedDate(`${cloudMonthKey}-01`);
@@ -4297,6 +4350,28 @@ const monthlyCourseNames = uniqueCourseNames(
     setCloudMessage(
       `${cloudMonthKey}をクラウドから読み込みました（${assignments?.length ?? 0}件）。`,
     );
+  };
+
+  const searchSavedMonth = async () => {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(searchMonth)) {
+      setMonthSearchMessage("確認したい年月を選んでください。");
+      return;
+    }
+    setMonthSearchMessage("");
+    const hasLocalMonth = Object.keys(shiftsByDate).some((date) => date.startsWith(`${searchMonth}-`));
+    if (hasLocalMonth) {
+      setAutoMonth(searchMonth);
+      setSelectedDate(`${searchMonth}-01`);
+      setSelectedWeek(0);
+      setMonthStatus("draft");
+      setMonthSearchMessage(`${searchMonth}の端末保存シフトを表示しています。公開状態はクラウド読込で確認できます。`);
+      return;
+    }
+    if (!session) {
+      setMonthSearchMessage("この端末に保存がありません。管理者ログイン後に検索してください。");
+      return;
+    }
+    await loadCloudMonth(searchMonth);
   };
 
   const finalChecks = useMemo(() => {
@@ -4354,13 +4429,11 @@ const monthlyCourseNames = uniqueCourseNames(
       const seen = new Map<string, string>();
 
       (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
-        const requiredCourseNames = resolveCourseNamesForDate(
-          date,
-          region,
-          coursePreset,
-          dailyCourseOverrides[date]?.[region],
-        );
         const dayCourses = dayShift?.[region] ?? [];
+        const requiredCourseNames = requiredCoursesForSavedDay(
+          date, region, coursePreset,
+          dailyCourseOverrides[date]?.[region], dayCourses,
+        );
 
         requiredCourseNames.forEach((requiredCourseName) => {
           const course = findActualCourse(dayCourses, requiredCourseName, region);
@@ -4887,7 +4960,7 @@ const monthlyCourseNames = uniqueCourseNames(
                   <button
                     type="button"
                     disabled={cloudBusy}
-                    onClick={loadCloudMonth}
+                    onClick={() => void loadCloudMonth()}
                     className="rounded-xl border border-white/15 bg-white/5 px-3.5 py-2 text-sm font-semibold hover:bg-white/10 disabled:opacity-50"
                   >
                     クラウドから読込
@@ -5757,6 +5830,21 @@ const monthlyCourseNames = uniqueCourseNames(
     <p className="mt-1 text-sm text-slate-400">
       ドライバー名を選択すると、その日のシフトを手動変更できます。
     </p>
+    <form className="mt-4 flex flex-wrap items-end gap-2" onSubmit={(event) => { event.preventDefault(); void searchSavedMonth(); }}>
+      <label className="text-sm text-slate-300">
+        確認する年月
+        <input type="month" required value={searchMonth} disabled={cloudBusy}
+          onChange={(event) => setSearchMonth(event.target.value)}
+          className="ml-2 rounded-lg border border-white/20 bg-slate-800 px-3 py-2 text-white" />
+      </label>
+      <button type="submit" disabled={cloudBusy} className="rounded-lg bg-blue-600 px-4 py-2 font-bold text-white disabled:opacity-50">
+        {cloudBusy ? "読込中…" : "検索"}
+      </button>
+    </form>
+    <p role="status" className="mt-2 text-sm text-sky-200">{monthSearchMessage || cloudMessage}</p>
+    {!Object.keys(shiftsByDate).some((date) => date.startsWith(`${autoMonth}-`)) && (
+      <p className="mt-2 text-sm text-amber-200">{autoMonth}の保存済みシフトはありません。</p>
+    )}
     <div className="mt-4 flex flex-wrap gap-2">
   {weekLabels.map((label, index) => (
     <button
@@ -5852,6 +5940,10 @@ const monthlyCourseNames = uniqueCourseNames(
                     className="border border-white/10 p-2"
                   >
                     {course ? (
+                      <div>
+                      {!sameCourseName(course.course, courseName) && (
+                        <div className="mb-1 text-xs text-cyan-300">{course.course}</div>
+                      )}
                       <select
                         value={course.driver}
                         onChange={(event) =>
@@ -5873,6 +5965,7 @@ const monthlyCourseNames = uniqueCourseNames(
                         )}
 
                         {standbyDrivers
+                          .filter((driver) => employedDuring(driver, dateKey, dateKey))
                           .filter(
                             (driver) =>
                               driver.area.replace("営業所", "") ===
@@ -5887,6 +5980,7 @@ const monthlyCourseNames = uniqueCourseNames(
                             </option>
                           ))}
                       </select>
+                      </div>
                     ) : (
                       <span className="text-slate-600">―</span>
                     )}

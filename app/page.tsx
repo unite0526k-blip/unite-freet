@@ -1,3 +1,4 @@
+
 "use client";
 
 import Link from "next/link";
@@ -27,10 +28,9 @@ function getSavedCount(key: string) {
 function getCurrentMonth() {
   const d = new Date();
 
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
-    2,
-    "0"
-  )}`;
+  return `${d.getFullYear()}-${String(
+    d.getMonth() + 1
+  ).padStart(2, "0")}`;
 }
 
 export default function Home() {
@@ -45,12 +45,16 @@ export default function Home() {
       // =========================
       // 車両
       // =========================
-      setVehicleCount(getSavedCount(VEHICLES_STORAGE_KEY));
+      setVehicleCount(
+        getSavedCount(VEHICLES_STORAGE_KEY)
+      );
 
       // =========================
       // ドライバー
       // =========================
-      setDriverCount(getSavedCount(DRIVERS_STORAGE_KEY));
+      setDriverCount(
+        getSavedCount(DRIVERS_STORAGE_KEY)
+      );
 
       // =========================
       // 資金・損益
@@ -73,7 +77,9 @@ export default function Home() {
             );
 
             const income = thisMonth
-              .filter((item: any) => item.type === "入金")
+              .filter(
+                (item: any) => item.type === "入金"
+              )
               .reduce(
                 (sum: number, item: any) =>
                   sum + Number(item.amount || 0),
@@ -81,7 +87,9 @@ export default function Home() {
               );
 
             const expense = thisMonth
-              .filter((item: any) => item.type === "出金")
+              .filter(
+                (item: any) => item.type === "出金"
+              )
               .reduce(
                 (sum: number, item: any) =>
                   sum + Number(item.amount || 0),
@@ -204,7 +212,6 @@ export default function Home() {
           className="block bg-white rounded-xl shadow p-6 hover:shadow-lg transition cursor-pointer md:col-span-2"
         >
           <div className="flex items-start justify-between gap-4">
-
             <div>
               <h2 className="text-xl font-bold">
                 💰 資金・損益管理
@@ -218,7 +225,6 @@ export default function Home() {
             <span className="text-sm text-gray-400">
               詳細を見る →
             </span>
-
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-5">
@@ -277,6 +283,20 @@ export default function Home() {
 
           <p className="mt-2">
             月間シフト・配置管理
+          </p>
+        </Link>
+
+        {/* コース別引き継ぎノート */}
+        <Link
+          href="/handover"
+          className="block bg-white rounded-xl shadow p-6 hover:shadow-lg transition"
+        >
+          <h2 className="text-xl font-bold">
+            📒 コース別引き継ぎノート
+          </h2>
+
+          <p className="mt-2">
+            営業所・コース別の配達注意事項
           </p>
         </Link>
 
