@@ -6,7 +6,9 @@ import { usePathname } from "next/navigation";
 
 export default function Sidebar() {
   const pathname = usePathname();
-
+  if (pathname === "/handover/share") {
+    return null;
+  }
   const menuItems = [
     {
       href: "/",
