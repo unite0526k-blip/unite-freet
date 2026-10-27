@@ -200,9 +200,29 @@ const resolveCourseNamesForDate = (
   region: Region,
   preset: "normal" | "weekday",
   override?: string[],
+  settings: CourseSetting[] = DEFAULT_COURSE_SETTINGS,
 ) => {
-  // 日別に明示された構成は、曜日の既定パターンと同じでも保持する。
-  return override ?? getCourseNamesForDate(dateValue, region, preset);
+  if (override !== undefined) return override;
+
+  const baseCourses = getCourseNamesForDate(dateValue, region, preset);
+
+  const additionalCourses = settings
+    .filter((setting) => setting.region === region)
+    .filter(
+      (setting) =>
+        !NORMAL_COURSE_NAMES[region].some((name) =>
+          sameCourseName(name, setting.name),
+        ),
+    )
+    .filter(
+      (setting) =>
+        !setting.closedWeekdays.includes(
+          new Date(`${dateValue}T00:00:00`).getDay(),
+        ),
+    )
+    .map((setting) => setting.name);
+
+  return uniqueCourseNames([...baseCourses, ...additionalCourses]);
 };
 
 const normalizeCourseName = (value: string) =>
@@ -468,6 +488,7 @@ export default function ShiftPage() {
   const [dailyCourseOverrides, setDailyCourseOverrides] =
     useState<DailyCourseOverrides>({});
   const [courseChangeOpen, setCourseChangeOpen] = useState(false);
+  const [temporaryCourseName, setTemporaryCourseName] = useState("");
   const [courseChangeSelection, setCourseChangeSelection] = useState<string[]>(
     [],
   );
@@ -552,6 +573,7 @@ export default function ShiftPage() {
         region,
         coursePreset,
         dailyCourseOverrides[date]?.[region],
+　　　　　courseSettings,
       ).length;
     }
     return total;
@@ -1008,6 +1030,7 @@ export default function ShiftPage() {
             region,
             preset,
             dailyCourseOverrides[date]?.[region],
+　　　　　　　courseSettings,
           );
 
           rebuilt[region] = names.map((name, index) => {
@@ -1060,9 +1083,13 @@ export default function ShiftPage() {
       return;
     }
 
-    const orderedNames = selectableCourseNames.filter((name) =>
-      courseChangeSelection.includes(name),
-    );
+const orderedNames = Array.from(
+  new Set(
+    courseChangeSelection
+      .map((name) => name.trim())
+      .filter(Boolean)
+  )
+);
     setDailyCourseOverrides((previous) => ({
       ...previous,
       [selectedDate]: {
@@ -1236,6 +1263,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
               region,
               coursePreset,
               dailyCourseOverrides[date]?.[region],
+　　　　　　　　courseSettings,
             ).length;
           }
           return total;
@@ -1659,6 +1687,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
           region,
           coursePreset,
           dailyCourseOverrides[date]?.[region],
+　　　　　　courseSettings,
         );
 
         courses[region] = courseNames.map((courseName, courseIndex) => {
@@ -3573,6 +3602,148 @@ const coursePriorityPenalty =
         });
       });
 
+      // ===== 月全体の追加最適化（既存の同日・別日連鎖修復の後） =====
+      // 301は目標。希望休・固定条件・同日重複・最大稼働日数・7連勤は守る。
+      // 既存のロック済み配置には触れず、全月を繰り返し走査する。
+      const monthKeys = Array.from({ length: lastDay }, (_, index) =>
+        `${autoMonth}-${String(index + 1).padStart(2, "0")}`,
+      );
+      const allMonthSlots = () => monthKeys.flatMap((dateKey) =>
+        (["松阪", "伊勢", "伊賀"] as Region[]).flatMap((region) =>
+          (generated[dateKey]?.[region] ?? []).map((course) => ({ dateKey, region, course })),
+        ),
+      );
+      const workedDatesFor = (name: string) => new Set(
+        allMonthSlots()
+          .filter(({ course }) => course.driver &&
+            normalizeDriverName(course.driver) === normalizeDriverName(name))
+          .map(({ dateKey }) => dateKey),
+      );
+      const hasSevenAfter = (name: string, add: string, remove?: string) => {
+        const worked = workedDatesFor(name);
+        if (remove) worked.delete(remove);
+        worked.add(add);
+        let streak = 0;
+        for (const dateKey of monthKeys) {
+          streak = worked.has(dateKey) ? streak + 1 : 0;
+          if (streak >= 7) return true;
+        }
+        return false;
+      };
+      const canPlaceMonthly = (
+        driver: DriverItem,
+        slot: { dateKey: string; region: Region; course: Course },
+        removeDate?: string,
+      ) => {
+        const { dateKey, region, course } = slot;
+        const day = Number(dateKey.slice(-2));
+        const weekday = new Date(`${dateKey}T00:00:00`).getDay();
+        if (course.isLocked) return false;
+        if (isAutoExcludedForGeneration(driver)) return false;
+        if (hasAnyExplicitGenerationTarget(driver.name) &&
+            getGenerationTotalTarget(driver.name) === 0) return false;
+        if (hasGenerationTargetWorkDays(region, driver.name) &&
+            getGenerationTargetWorkDays(region, driver.name) === 0) return false;
+        if (!eligibleRegions.get(driver.name)?.has(region)) return false;
+        if (requestedOff(driver.name, day, weekday)) return false;
+        if (!canHandleCourseForGeneration(driver, region, course.course)) return false;
+        if (!isConfiguredCourse(driver.name, region, course.course)) return false;
+        if (!fixedCourseMatches(driver.fixedCourse, course.course)) return false;
+        if (driver.name === "東 真規" && (weekday === 1 ||
+            !["神久コース", "神久・朝熊コース"].includes(course.course))) return false;
+        if (driver.name === "中川 昭治" && (weekday === 4 || course.course !== "Hコース")) return false;
+        const days = workedDatesFor(driver.name);
+        if (days.has(dateKey) && removeDate !== dateKey) return false;
+        const max = parsedConditions.get(driver.name)?.maximumWorkDays;
+        if (max !== undefined && days.size + (removeDate ? 0 : 1) > max) return false;
+        if (hasSevenAfter(driver.name, dateKey, removeDate)) return false;
+        return true;
+      };
+      const chooseMonthlyDriver = (
+        slot: { dateKey: string; region: Region; course: Course },
+        removeDate?: string,
+      ) => uniqueDrivers
+        .filter((driver) => canPlaceMonthly(driver, slot, removeDate))
+        .sort((a, b) => {
+          const aDays = workedDatesFor(a.name).size;
+          const bDays = workedDatesFor(b.name).size;
+          const aTarget = getGenerationTotalTarget(a.name) || 24;
+          const bTarget = getGenerationTotalTarget(b.name) || 24;
+          return (aDays - aTarget) - (bDays - bTarget) || aDays - bDays;
+        });
+
+      // 空き枠に直接配置。無理なら別日の担当者を移し、空いた枠を別人で埋める。
+      // この2段階の交換を月全体で反復することで、月初の配置を固定しない。
+      for (let monthPass = 0; monthPass < 8; monthPass += 1) {
+        let improved = false;
+        for (const empty of allMonthSlots().filter(({ course }) => !course.driver && !course.isLocked)) {
+          const direct = chooseMonthlyDriver(empty).find((driver) => {
+            const max = parsedConditions.get(driver.name)?.maximumWorkDays;
+            return max === undefined || workedDatesFor(driver.name).size < max;
+          });
+          if (direct) {
+            empty.course.driver = direct.name;
+            empty.course.status = direct.mainArea === empty.region ? "配車済" : "応援";
+            empty.course.memo = "月間再調整：直接配置";
+            improved = true;
+            continue;
+          }
+          let resolved = false;
+          for (const donor of allMonthSlots()) {
+            if (resolved) break;
+            if (!donor.course.driver || donor.course.isLocked || donor.dateKey === empty.dateKey) continue;
+            const mover = uniqueDrivers.find((driver) =>
+              normalizeDriverName(driver.name) === normalizeDriverName(donor.course.driver));
+            if (!mover || !canPlaceMonthly(mover, empty, donor.dateKey)) continue;
+            // 元の担当枠を、元の日に出勤していない別の人へ渡す。
+            const replacement = chooseMonthlyDriver(donor)
+              .find((driver) => normalizeDriverName(driver.name) !== normalizeDriverName(mover.name));
+            if (!replacement) continue;
+            empty.course.driver = mover.name;
+            empty.course.status = mover.mainArea === empty.region ? "配車済" : "応援";
+            empty.course.memo = "月間再調整：別日交換";
+            donor.course.driver = replacement.name;
+            donor.course.status = replacement.mainArea === donor.region ? "配車済" : "応援";
+            donor.course.memo = "月間再調整：別日交換";
+            improved = true;
+            resolved = true;
+          }
+        }
+        if (!improved) break;
+      }
+
+      // 7連勤が残っている場合、連勤中の1枠を別の出勤可能者へ渡す。
+      // 代役がいなければ無理に変更せず、最終採点で警告する。
+      for (let streakPass = 0; streakPass < 4; streakPass += 1) {
+        let changed = false;
+        for (const driver of uniqueDrivers) {
+          const dates = workedDatesFor(driver.name);
+          let streak = 0;
+          for (let index = 0; index < monthKeys.length; index += 1) {
+            streak = dates.has(monthKeys[index]) ? streak + 1 : 0;
+            if (streak < 7) continue;
+            const streakDates = monthKeys.slice(index - 6, index + 1);
+            for (const dateKey of streakDates) {
+              const assigned = allMonthSlots().find((slot) =>
+                slot.dateKey === dateKey && !slot.course.isLocked &&
+                normalizeDriverName(slot.course.driver) === normalizeDriverName(driver.name));
+              if (!assigned) continue;
+              const replacement = chooseMonthlyDriver(assigned).find((candidate) =>
+                normalizeDriverName(candidate.name) !== normalizeDriverName(driver.name));
+              if (!replacement) continue;
+              assigned.course.driver = replacement.name;
+              assigned.course.status = replacement.mainArea === assigned.region ? "配車済" : "応援";
+              assigned.course.memo = "月間再調整：7連勤解消";
+              changed = true;
+              break;
+            }
+            if (changed) break;
+          }
+          if (changed) break;
+        }
+        if (!changed) break;
+      }
+
       // 修復後の未配置数を採点に使う。
       unassignedCount = Object.values(generated).reduce(
         (total, dayShifts) =>
@@ -3899,9 +4070,18 @@ if (
   driverName &&
   targetCourse &&
   selectedDriver &&
+  !(
+    dailyCourseOverrides[dateKey]?.[region]?.some(
+      (name) => sameCourseName(name, targetCourse.course),
+    ) &&
+    !courseSettings.some(
+      (setting) =>
+        setting.region === region &&
+        sameCourseName(setting.name, targetCourse.course),
+    )
+  ) &&
   !canDriverDriveCourse(selectedDriver, region, targetCourse.course)
-) {
-  window.alert(
+) {  window.alert(
     `${driverName}さんは${region}の${targetCourse.course}を担当可能コースに登録していません。`,
   );
   return;
@@ -4168,12 +4348,15 @@ const displayedDateKeys = monthlyDateKeys.slice(
 // 月間シフト表の行は「登録されている基本コース」を固定表示する。
 // AB/BC/CDなどの結合コースは別行として増やさず、その日のセル側で扱う。
 // これで A〜H + 追加コース（例: 高町）のシンプルな表を維持する。
-const monthlyCourseNames = uniqueCourseNames(
-  courseSettings
+const monthlyCourseNames = uniqueCourseNames([
+  ...courseSettings
     .filter((setting) => setting.region === activeTab)
     .map((setting) => setting.name),
-);
 
+  ...monthlyDateKeys.flatMap(
+    (date) => dailyCourseOverrides[date]?.[activeTab] ?? []
+  ),
+]);
   const signIn = async () => {
     setCloudBusy(true);
     setCloudMessage("");
@@ -4888,9 +5071,40 @@ const monthlyCourseNames = uniqueCourseNames(
                     閉じる
                   </button>
                 </div>
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+  <input
+    type="text"
+    value={temporaryCourseName}
+    onChange={(e) => setTemporaryCourseName(e.target.value)}
+    placeholder="例：臨時A"
+    className="rounded-lg border border-white/20 bg-slate-800 px-3 py-2 text-sm text-white"
+  />
 
+  <button
+    type="button"
+    onClick={() => {
+      const name = temporaryCourseName.trim();
+
+      if (!name) {
+        setAutoMessage("臨時コース名を入力してください。");
+        return;
+      }
+
+      setCourseChangeSelection((previous) =>
+        previous.includes(name) ? previous : [...previous, name]
+      );
+
+      setTemporaryCourseName("");
+    }}
+    className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-bold text-white"
+  >
+    ＋ 臨時コース追加
+  </button>
+</div>
                 <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
-                  {selectableCourseNames.map((name) => {
+                  {Array.from(
+ 　　　　　　　　　 new Set([...selectableCourseNames, ...courseChangeSelection])
+　　　　　　　　　　).map((name) => {
                     const selected = courseChangeSelection.includes(name);
                     return (
                       <label
@@ -5900,13 +6114,13 @@ const monthlyCourseNames = uniqueCourseNames(
               </td>
 
               {displayedDateKeys.map((dateKey) => {
-                const effectiveCourseNames = resolveCourseNamesForDate(
-                  dateKey,
-                  activeTab,
-                  coursePreset,
-                  dailyCourseOverrides[dateKey]?.[activeTab],
-                );
-                const baseName = normalizeCourseName(courseName);
+const effectiveCourseNames = resolveCourseNamesForDate(
+  dateKey,
+  activeTab,
+  coursePreset,
+  dailyCourseOverrides[dateKey]?.[activeTab],
+  courseSettings,
+);                const baseName = normalizeCourseName(courseName);
                 const dayCourses = shiftsByDate[dateKey]?.[activeTab] ?? [];
 
                 // 通常は同じ基本コースを表示。
@@ -5932,7 +6146,18 @@ const monthlyCourseNames = uniqueCourseNames(
                   return false;
                 });
 
-                const course = mergedCourseForBase;
+                const course =
+  mergedCourseForBase ??
+  (
+    effectiveCourseNames.some((name) =>
+      sameCourseName(name, courseName)
+    )
+      ? createCourse(
+          Date.parse(dateKey) + monthlyCourseNames.indexOf(courseName),
+          courseName
+        )
+      : null
+  );
 
                 return (
                   <td
