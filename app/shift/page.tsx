@@ -6,6 +6,8 @@ import type { Session } from "@supabase/supabase-js";
 import { loadData, saveData } from "../../lib/storage";
 import { supabase as maybeSupabase } from "../../lib/supabase";
 
+import DriverCalendar from "./DriverCalendar";
+
 const supabase = maybeSupabase!;
 
 type Region = "松阪" | "伊勢" | "伊賀";
@@ -1489,6 +1491,23 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
       return hash % 2001;
     };
 
+    const firstDayOfMonth = new Date(year, month - 1, 1);
+    // 前月末6日をすべての連勤判定で共通利用する（前月の配置は変更しない）。
+    const previousSixDates = Array.from({ length: 6 }, (_, index) => {
+      const date = new Date(year, month - 1, index - 5);
+      return formatDateKey(date);
+    });
+    const workedInPreviousMonth = (driverName: string, dateKey: string) =>
+      Object.values(shiftsByDate[dateKey] ?? {}).flat().some(
+        (course) => Boolean(course.driver) &&
+          normalizeDriverName(course.driver) === normalizeDriverName(driverName),
+      );
+    const previousWorkedDates = (driverName: string) =>
+      previousSixDates.filter((dateKey) => workedInPreviousMonth(driverName, dateKey));
+    const previousAndCurrentDates = (currentDates: string[]) =>
+      [...previousSixDates, ...currentDates];
+
+
     for (let trial = 0; trial < trialCount; trial += 1) {
       const workCounts = new Map<string, number>();
       const regionalWorkCounts = new Map<string, number>();
@@ -1526,8 +1545,6 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
       dates.add(String(row.requested_date).slice(0, 10));
       registeredDaysOff.set(name, dates);
     });
-    const firstDayOfMonth = new Date(year, month - 1, 1);
-
     getUniqueDrivers().forEach((driver) => {
       let previousMonthStreak = 0;
 
@@ -2314,7 +2331,7 @@ const coursePriorityPenalty =
               targetIndex += 1
             ) {
               const targetCourse = dayCourses[targetIndex];
-              if (targetCourse.driver) continue;
+              if (targetCourse.driver || targetCourse.isLocked) continue;
 
               const assignedNames = rebuildAssignedToday(dateKey);
               const regionalDrivers = uniqueDrivers.filter((driver) =>
@@ -2571,17 +2588,18 @@ const coursePriorityPenalty =
         const [year, month] = autoMonth.split("-").map(Number);
         const last = new Date(year, month, 0).getDate();
 
-        const works = (day: number) => {
-          if (day < 1 || day > last) return false;
-          const key = `${autoMonth}-${String(day).padStart(2, "0")}`;
+        const works = (key: string) => {
+          if (previousSixDates.includes(key)) return workedInPreviousMonth(driverName, key);
           if (removeDateKey && key === removeDateKey) return false;
           if (key === addDateKey) return true;
           return driverWorksOnGeneratedDate(driverName, key);
         };
 
         let streak = 0;
-        for (let day = 1; day <= last; day += 1) {
-          streak = works(day) ? streak + 1 : 0;
+        const monthDates = Array.from({ length: last }, (_, i) =>
+          `${autoMonth}-${String(i + 1).padStart(2, "0")}`);
+        for (const dateKey of previousAndCurrentDates(monthDates)) {
+          streak = works(dateKey) ? streak + 1 : 0;
           if (streak >= 7) return true;
         }
         return false;
@@ -2647,7 +2665,7 @@ const coursePriorityPenalty =
               targetIndex += 1
             ) {
               const targetCourse = targetCourses[targetIndex];
-              if (targetCourse.driver) continue;
+              if (targetCourse.driver || targetCourse.isLocked) continue;
 
               const targetAssigned = rebuildAssignedToday(targetDate);
               let fixed = false;
@@ -2734,11 +2752,8 @@ const coursePriorityPenalty =
                           regionalCountKey(region, driver.name),
                         ) ?? 0;
 
-                      if (
-                        actual >= target &&
-                        !canAddSupportBeyondRegionalTarget(driver, region)
-                      )
-                        return false;
+                      // 301完成営業所の別日交換では超過配置を禁止。
+                      if (actual >= target) return false;
 
                       const maximumWorkDays =
                         parsedConditions.get(driver.name)?.maximumWorkDays;
@@ -2841,7 +2856,7 @@ const coursePriorityPenalty =
               targetIndex += 1
             ) {
               const missingCourse = targetCourses[targetIndex];
-              if (missingCourse.driver) continue;
+              if (missingCourse.driver || missingCourse.isLocked) continue;
 
               let solved = false;
 
@@ -2998,11 +3013,9 @@ const coursePriorityPenalty =
                               regionalCountKey(region, c.name),
                             ) ?? 0;
 
-                          if (
-                            actual >= target &&
-                            !canAddSupportBeyondRegionalTarget(c, region)
-                          )
-                            return false;
+                          // 301が完成している営業所では、追加枠を認めず
+                          // 不足日数のある人だけで連鎖交換を閉じる。
+                          if (actual >= target) return false;
 
                           const maximumWorkDays =
                             parsedConditions.get(c.name)?.maximumWorkDays;
@@ -3114,16 +3127,15 @@ const coursePriorityPenalty =
       const wouldCreateSevenDayStreak = (driverName: string, addDate: string) => {
         const dates = countActualWorkedDates(driverName);
         dates.add(addDate);
-        const dayNumber = Number(addDate.slice(-2));
+        previousWorkedDates(driverName).forEach((dateKey) => dates.add(dateKey));
         let consecutive = 0;
-        for (let d = Math.max(1, dayNumber - 6); d <= Math.min(lastDay, dayNumber + 6); d += 1) {
-          const key = `${autoMonth}-${String(d).padStart(2, "0")}`;
-          if (dates.has(key)) {
-            consecutive += 1;
-            if (consecutive >= 7) return true;
-          } else {
-            consecutive = 0;
-          }
+        const allDates = previousAndCurrentDates(
+          Array.from({ length: lastDay }, (_, i) =>
+            `${autoMonth}-${String(i + 1).padStart(2, "0")}`),
+        );
+        for (const key of allDates) {
+          consecutive = dates.has(key) ? consecutive + 1 : 0;
+          if (consecutive >= 7) return true;
         }
         return false;
       };
@@ -3621,10 +3633,11 @@ const coursePriorityPenalty =
       );
       const hasSevenAfter = (name: string, add: string, remove?: string) => {
         const worked = workedDatesFor(name);
+        previousWorkedDates(name).forEach((dateKey) => worked.add(dateKey));
         if (remove) worked.delete(remove);
         worked.add(add);
         let streak = 0;
-        for (const dateKey of monthKeys) {
+        for (const dateKey of previousAndCurrentDates(monthKeys)) {
           streak = worked.has(dateKey) ? streak + 1 : 0;
           if (streak >= 7) return true;
         }
@@ -3718,11 +3731,14 @@ const coursePriorityPenalty =
         let changed = false;
         for (const driver of uniqueDrivers) {
           const dates = workedDatesFor(driver.name);
+          previousWorkedDates(driver.name).forEach((dateKey) => dates.add(dateKey));
+          const allDates = previousAndCurrentDates(monthKeys);
           let streak = 0;
-          for (let index = 0; index < monthKeys.length; index += 1) {
-            streak = dates.has(monthKeys[index]) ? streak + 1 : 0;
+          for (let index = 0; index < allDates.length; index += 1) {
+            streak = dates.has(allDates[index]) ? streak + 1 : 0;
             if (streak < 7) continue;
-            const streakDates = monthKeys.slice(index - 6, index + 1);
+            const streakDates = allDates.slice(index - 6, index + 1)
+              .filter((dateKey) => dateKey.startsWith(`${autoMonth}-`));
             for (const dateKey of streakDates) {
               const assigned = allMonthSlots().find((slot) =>
                 slot.dateKey === dateKey && !slot.course.isLocked &&
@@ -3775,10 +3791,11 @@ const coursePriorityPenalty =
       uniqueDrivers.forEach((driver) => {
         let consecutiveDays = 0;
 
-        Object.keys(generated)
-          .sort()
+        previousAndCurrentDates(Object.keys(generated).sort())
           .forEach((dateKey) => {
-            const worked = Object.values(generated[dateKey] ?? {})
+            const worked = previousSixDates.includes(dateKey)
+              ? workedInPreviousMonth(driver.name, dateKey)
+              : Object.values(generated[dateKey] ?? {})
               .flat()
               .some(
                 (course) =>
@@ -3964,12 +3981,91 @@ const coursePriorityPenalty =
     }
 
     const selectedGenerated = bestGenerated;
+
+    // 【絶対条件】7連勤以上の候補をそのまま画面へ反映しない。
+    // 代役を探しても残った連勤は、ロックされていない1日分の配置を
+    // 未配置へ戻して必ず切る。ロック済みだけで7連勤になる場合は
+    // 既存のシフトを変更せず、自動作成を中止する。
+    const safetyDates = Array.from({ length: lastDay }, (_, i) =>
+      `${autoMonth}-${String(i + 1).padStart(2, "0")}`,
+    );
+    const safetyRegions: Region[] = ["松阪", "伊勢", "伊賀"];
+    const slotsForDriverOnDate = (name: string, dateKey: string) =>
+      safetyRegions.flatMap((region) =>
+        (selectedGenerated[dateKey]?.[region] ?? [])
+          .filter((course) =>
+            Boolean(course.driver) &&
+            normalizeDriverName(course.driver) === normalizeDriverName(name),
+          )
+          .map((course) => ({ course, region })),
+      );
+    let forcedUnassignedForStreak = 0;
+    for (const driver of uniqueDrivers) {
+      let streakDates: string[] = [];
+      for (const dateKey of previousAndCurrentDates(safetyDates)) {
+        const worked = previousSixDates.includes(dateKey)
+          ? workedInPreviousMonth(driver.name, dateKey)
+          : slotsForDriverOnDate(driver.name, dateKey).length > 0;
+        if (!worked) {
+          streakDates = [];
+          continue;
+        }
+        streakDates.push(dateKey);
+        if (streakDates.length < 7) continue;
+
+        // 直近7日のうち、当該ドライバーの全枠が解除可能な日を選ぶ。
+        // 同日に複数コースへ入っていても、1日分をまとめて解除する。
+        const breakDate = [...streakDates].reverse().find((dayKey) =>
+          dayKey.startsWith(`${autoMonth}-`) &&
+          slotsForDriverOnDate(driver.name, dayKey).length > 0 &&
+          slotsForDriverOnDate(driver.name, dayKey).every(({ course }) => !course.isLocked),
+        );
+        if (!breakDate) {
+          setAutoMessage(
+            `自動作成を中止しました。${driver.name}さんの${streakDates[0]}〜${dateKey}に` +
+            `ロック済み配置による7連勤があります。ロックを見直してから再実行してください。` +
+            `既存シフトは変更していません。`,
+          );
+          return;
+        }
+        for (const { course } of slotsForDriverOnDate(driver.name, breakDate)) {
+          course.driver = "";
+          course.status = "未配車";
+          course.memo = "7連勤禁止：安全優先で未配置";
+          forcedUnassignedForStreak += 1;
+        }
+        // 解除日より後に連続していた日だけを引き継ぐ。
+        streakDates = streakDates.slice(streakDates.indexOf(breakDate) + 1);
+      }
+    }
+    // 最終防御：想定外の連勤が残った場合も適用しない。
+    for (const driver of uniqueDrivers) {
+      let streak = 0;
+      for (const dateKey of previousAndCurrentDates(safetyDates)) {
+        const worked = previousSixDates.includes(dateKey)
+          ? workedInPreviousMonth(driver.name, dateKey)
+          : slotsForDriverOnDate(driver.name, dateKey).length > 0;
+        streak = worked ? streak + 1 : 0;
+        if (streak >= 7) {
+          setAutoMessage(`自動作成を中止しました。${driver.name}さんの7連勤が解消できません。既存シフトは変更していません。`);
+          return;
+        }
+      }
+    }
+    bestSevenDayStreakCount = 0;
+    bestUnassignedCount = Object.values(selectedGenerated).reduce(
+      (total, dayShifts) => total + Object.values(dayShifts).flat()
+        .filter((course) => !course.driver).length,
+      0,
+    );
     setShiftsByDate((previous) => ({ ...previous, ...selectedGenerated }));
     setSelectedDate(`${autoMonth}-01`);
 
     const warnings: string[] = [];
     if (bestUnassignedCount > 0)
       warnings.push(`未配置が${bestUnassignedCount}件`);
+    if (forcedUnassignedForStreak > 0)
+      warnings.push(`7連勤禁止のため${forcedUnassignedForStreak}枠を未配置に変更`);
     if (bestDuplicateCount > 0)
       warnings.push(`同日重複が${bestDuplicateCount}件`);
     if (bestSevenDayStreakCount > 0)
@@ -4986,7 +5082,48 @@ const monthlyCourseNames = uniqueCourseNames([
       return { name: driver.name, dates };
     })
     .sort((a, b) => a.name.localeCompare(b.name, "ja"));
+  const [driverCalendarSearch, setDriverCalendarSearch] = useState("");
 
+  const calendarDrivers = driversForTargetRegion(activeTab)
+  .filter((driver) =>
+    driver.name
+      .replace(/\s/g, "")
+      .includes(driverCalendarSearch.replace(/\s/g, "").trim())
+  )
+  .map((driver) => {
+    const entries: {
+      date: string;
+      office: string;
+      course: string;
+    }[] = [];
+
+    Object.entries(shiftsByDate).forEach(([date, offices]) => {
+      if (!date.startsWith(`${autoMonth}-`)) return;
+
+      Object.entries(offices).forEach(([office, courses]) => {
+        courses.forEach((course) => {
+          if (
+            course.driver.replace(/\s/g, "") ===
+            driver.name.replace(/\s/g, "")
+          ) {
+            entries.push({
+              date,
+              office,
+              course: course.course,
+            });
+          }
+        });
+      });
+    });
+
+    entries.sort((a, b) => a.date.localeCompare(b.date));
+
+    return {
+      name: driver.name,
+      mainOffice: activeTab,
+      entries,
+    };
+  });
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top_left,_#111827,_#030712_70%)] text-slate-100">
       <div className="flex min-h-screen flex-col lg:flex-row">
@@ -5839,7 +5976,42 @@ const monthlyCourseNames = uniqueCourseNames([
               ))}
             </div>
 
+<details className="mt-4 rounded-2xl border border-white/10 bg-slate-900/50 p-4">
+  <summary className="cursor-pointer text-base font-semibold text-white">
+    📅 ドライバー個人別カレンダー
+  </summary>
+
+  <div className="mt-4 space-y-4">
+    <input
+      type="text"
+      placeholder="ドライバー名で検索"
+      value={driverCalendarSearch}
+      onChange={(event) =>
+        setDriverCalendarSearch(event.target.value)
+      }
+      className="w-full rounded-xl border border-white/20 bg-slate-800 px-4 py-3 text-white placeholder:text-slate-400"
+    />
+
+    {calendarDrivers.map((driver) => (
+      <DriverCalendar
+        key={driver.name}
+        driverName={driver.name}
+        mainOffice={driver.mainOffice}
+        month={autoMonth}
+        entries={driver.entries}
+      />
+    ))}
+
+    {calendarDrivers.length === 0 && (
+      <p className="text-sm text-slate-400">
+        該当するドライバーがいません。
+      </p>
+    )}
+  </div>
+</details>
+
             <details className="mt-4 rounded-2xl border border-cyan-400/20 bg-cyan-400/5 p-4">
+             
               <summary className="cursor-pointer text-base font-semibold text-white">
                 📅 月間出勤日数（{activeTab}・{autoMonth}）
               </summary>

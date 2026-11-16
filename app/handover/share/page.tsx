@@ -376,23 +376,21 @@ useEffect(() => {
   }, [notes, office, course, search]);
 
   const getTown = (address: string) => {
-  const value = address.trim().replace(/\s+/g, "");
+    const value = address
+      .normalize("NFKC")
+      .replace(/[\s\u3000]+/g, "")
+      .replace(/南虹[ヶケが]丘町/g, "南虹が丘町")
+      .replace(/^(?:東京都|北海道|(?:京都|大阪)府|.{2,3}県)/, "");
 
-  const match = value.match(
-    /^(.+?(?:市|区|町|村))(.+?(?:町|丁目|台|丘|野|田|原|浜|浦|島|谷|台地))/
-  );
+    if (!value) return "町名未設定";
 
-  if (match) {
-    return `${match[1]}${match[2]}`;
-  }
+    // 住所末尾の番地・号・数字を取り除いて同じ町名にまとめる。
+    const town = value
+      .replace(/[0-9]+(?:丁目|番地|番|号)?(?:[-－ー−‐][0-9]+)*(?:号)?(?:[-－ー−‐][0-9]+)*$/g, "")
+      .replace(/[-－ー−‐]+$/, "");
 
-  return value
-    .replace(/[０-９]/g, (n) =>
-      String(n.charCodeAt(0) - 0xff10)
-    )
-    .replace(/[0-9]+(?:丁目|番地|番|号)?(?:[-－ー−‐][0-9]+)*/g, "")
-    .replace(/[-－ー−‐]+$/, "") || "町名未設定";
-};
+    return town || "町名未設定";
+  };
 
   const townGroups = useMemo(() => {
     const groups: Record<string, Note[]> = {};

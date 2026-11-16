@@ -1,20 +1,6 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
-
-const sidebarItems = [
-  { label: 'ダッシュボード', href: '/dashboard' },
-  { label: 'ドライバー', href: '/drivers' },
-  { label: '車両', href: '/vehicles' },
-  { label: '配達', href: '/deliveries' },
-  { label: 'シフト', href: '/shifts' },
-  { label: '売上', href: '/sales' },
-  { label: 'KPI', href: '/kpi' },
-  { label: 'サポート', href: '/support' },
-  { label: 'クレーム', href: '/claims' },
-  { label: '設定', href: '/settings' },
-];
 
 const deliveryRows = [
   { driver: '田中', area: '中央区', planned: 38, completed: 31, progress: 82, location: '東京駅前', status: '進行中' },
@@ -46,8 +32,6 @@ const levelStyles: Record<string, string> = {
 };
 
 export default function DashboardPage() {
-  const pathname = usePathname();
-
   const today = new Date().toLocaleDateString('ja-JP', {
     year: 'numeric',
     month: 'long',
@@ -62,37 +46,7 @@ export default function DashboardPage() {
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top_left,_#111827,_#030712_70%)] text-slate-100">
-      <div className="flex min-h-screen flex-col lg:flex-row">
-        <aside className="w-full border-b border-white/10 bg-[#05070b] p-5 shadow-[0_20px_50px_rgba(0,0,0,0.35)] lg:w-72 lg:border-b-0 lg:border-r">
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.35em] text-slate-400">
-              Unified Fleet OS
-            </p>
-            <h1 className="mt-2 text-2xl font-semibold text-white">UNITE Fleet</h1>
-            <p className="mt-1 text-sm text-slate-400">Operations Center</p>
-          </div>
-
-          <nav className="mt-6 space-y-1.5">
-            {sidebarItems.map((item) => {
-              const isActive = pathname === item.href;
-              return (
-                <Link
-                  key={item.label}
-                  href={item.href}
-                  className={`flex items-center justify-between rounded-xl px-3.5 py-2.5 text-sm font-medium transition ${
-                    isActive
-                      ? 'bg-white text-slate-950 shadow-sm'
-                      : 'text-slate-300 hover:bg-white/10 hover:text-white'
-                  }`}
-                >
-                  <span>{item.label}</span>
-                  <span className="text-xs opacity-70">→</span>
-                </Link>
-              );
-            })}
-          </nav>
-        </aside>
-
+      <div className="min-h-screen">
         <section className="flex-1 p-3 sm:p-4 lg:p-5 xl:p-6">
           <div className="rounded-[28px] border border-white/10 bg-slate-950/80 p-4 shadow-[0_20px_60px_rgba(0,0,0,0.35)] sm:p-5">
             <div className="flex flex-col gap-3 border-b border-white/10 pb-4 lg:flex-row lg:items-center lg:justify-between">

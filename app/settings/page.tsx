@@ -26,6 +26,8 @@ type MasterDriver = {
   office: string;
   subOffice?: string;
   subOffices?: string[];
+  status?: string;
+  retirementDate?: string;
 };
 const WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"];
 
@@ -165,9 +167,23 @@ try {
       ]),
     );
 
-    // 表示するドライバーは fleet_master（ドライバー管理）にいる人だけ。
+    // 退職者は設定画面に表示しない。PIN・設定データはDBから削除しない。
+    // 退職日は最終在籍日として扱い、翌日から非表示にする。
+    const today = new Date();
+    const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const isActiveDriver = (master: MasterDriver) => {
+      const retirementDate = String(master.retirementDate ?? "")
+        .slice(0, 10)
+        .replace(/\//g, "-");
+      if (/^\d{4}-\d{2}-\d{2}$/.test(retirementDate)) {
+        return retirementDate >= todayKey;
+      }
+      return !String(master.status ?? "").includes("退職");
+    };
+
+    // 表示するのはドライバー管理の在籍者だけ。
     const synchronizedDrivers: DriverSetting[] = nextMasterDrivers
-      .filter((master) => master.name?.trim())
+      .filter((master) => master.name?.trim() && isActiveDriver(master))
       .map((master) => {
         const existing = settingsByName.get(normalizeName(master.name));
         return {

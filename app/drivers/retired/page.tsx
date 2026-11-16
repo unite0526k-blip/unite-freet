@@ -1,278 +1,251 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
-import type { Session } from "@supabase/supabase-js";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { supabase as maybeSupabase } from "../../../lib/supabase";
 
 const supabase = maybeSupabase!;
+const STORAGE_KEY = "unite-fleet-drivers";
 
 type Driver = {
   id: number;
-  office: string;
-  subOffice?: string;
-  subOffices?: string[];
   name: string;
-  phone: string;
+  office: string;
+  phone?: string;
   startDate?: string;
   retirementDate?: string;
   status: "稼働" | "休み" | "応援" | "退職";
-  supportedCourses?: string[];
-  fixedCourse?: string;
-  assignmentMode?: "通常" | "応援のみ" | "最終候補" | "自動除外";
+  [key: string]: unknown;
 };
 
-const STORAGE_KEY = "unite-fleet-drivers";
-const DRIVERS_INITIALIZED_KEY = "unite-fleet-drivers-initialized";
+function normalizeName(value: string) {
+  return value.replace(/[\s　]+/g, "").trim();
+}
+
+function tenure(startText?: string, endText?: string) {
+  if (!startText || !endText) return "未登録";
+  const start = new Date(`${startText}T00:00:00`);
+  const end = new Date(`${endText}T00:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return "日付確認";
+  let months = (end.getFullYear() - start.getFullYear()) * 12 + end.getMonth() - start.getMonth();
+  if (end.getDate() < start.getDate()) months--;
+  months = Math.max(0, months);
+  const anchor = new Date(start);
+  anchor.setDate(1);
+  anchor.setMonth(anchor.getMonth() + months);
+  anchor.setDate(Math.min(start.getDate(), new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0).getDate()));
+  const days = Math.max(0, Math.floor((end.getTime() - anchor.getTime()) / 86400000));
+  if (days >= 15) months++;
+  const years = Math.floor(months / 12);
+  const rest = months % 12;
+  return years ? `${years}年${rest ? `${rest}ヶ月` : ""}` : `${months}ヶ月`;
+}
 
 export default function RetiredDriversPage() {
   const [drivers, setDrivers] = useState<Driver[]>([]);
-  const [session, setSession] = useState<Session | null>(null);
-  const [search, setSearch] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-  const [editingRetirementId, setEditingRetirementId] = useState<number | null>(null);
-  const [retirementDateInput, setRetirementDateInput] = useState("");
+  const [search, setSearch] = useState("");
+  const [dateEdits, setDateEdits] = useState<Record<number, string>>({});
+  const [pinEdits, setPinEdits] = useState<Record<number, string>>({});
+  const [visiblePins, setVisiblePins] = useState<Record<number, string>>({});
+  const [pinLoadingId, setPinLoadingId] = useState<number | null>(null);
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
-    return () => data.subscription.unsubscribe();
+  const load = useCallback(async () => {
+    setLoading(true);
+    setVisiblePins({});
+    try {
+      const { data: auth } = await supabase.auth.getSession();
+      if (auth.session) {
+        const { data, error } = await supabase.from("fleet_master").select("drivers").eq("id", "default").single();
+        if (error) throw error;
+        if (!Array.isArray(data?.drivers)) throw new Error("クラウドの名簿を確認できません。");
+        setDrivers(data.drivers as Driver[]);
+        setMessage("");
+      } else {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) throw new Error("ローカル名簿がありません。管理者ログインしてから開いてください。");
+        const parsed: unknown = JSON.parse(raw);
+        if (!Array.isArray(parsed)) throw new Error("ローカル名簿の形式が正しくありません。");
+        setDrivers(parsed as Driver[]);
+        setMessage("ローカルの名簿を表示中です。変更には管理者ログインが必要です。");
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "読込に失敗しました。");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  useEffect(() => {
-    const load = async () => {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        try { setDrivers(JSON.parse(saved)); } catch {}
-      }
-      const { data } = await supabase
-        .from("fleet_master")
-        .select("drivers")
-        .eq("id", "default")
-        .maybeSingle();
-      if (data && Array.isArray(data.drivers)) {
-        const next = data.drivers as Driver[];
-        setDrivers(next);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-        localStorage.setItem(DRIVERS_INITIALIZED_KEY, "true");
-      }
-    };
-    load();
-  }, []);
+  useEffect(() => { void load(); }, [load]);
 
-  const getTenure = (startDate?: string, retirementDate?: string) => {
-    if (!startDate) return "未登録";
-    const start = new Date(`${startDate}T00:00:00`);
-    const end = retirementDate ? new Date(`${retirementDate}T00:00:00`) : new Date();
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return "日付確認";
-    let months = (end.getFullYear() - start.getFullYear()) * 12 + end.getMonth() - start.getMonth();
-    if (end.getDate() < start.getDate()) months -= 1;
-    months = Math.max(0, months);
-    const years = Math.floor(months / 12);
-    const rest = months % 12;
-    if (years && rest) return `${years}年${rest}ヶ月`;
-    if (years) return `${years}年`;
-    return `${months}ヶ月`;
-  };
+  const retired = useMemo(() => drivers.filter((d) => d.status === "退職")
+    .filter((d) => [d.name, d.office, d.phone ?? ""].join(" ").toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => (b.retirementDate ?? "").localeCompare(a.retirementDate ?? "")), [drivers, search]);
 
-  const retiredDrivers = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return drivers
-      .filter((d) => d.status === "退職")
-      .filter((d) => [d.name, d.office, d.phone, d.startDate ?? "", d.retirementDate ?? ""]
-        .join(" ").toLowerCase().includes(q))
-      .sort((a, b) => (b.retirementDate ?? "").localeCompare(a.retirementDate ?? ""));
-  }, [drivers, search]);
-
-  const saveRetirementDate = async (id: number) => {
-    const target = drivers.find((d) => d.id === id);
-    if (!target) return;
-    if (!retirementDateInput) {
-      alert("退職日を入力してください");
-      return;
-    }
-    if (target.startDate && retirementDateInput < target.startDate) {
-      alert("退職日は勤務開始日以降の日付にしてください");
-      return;
-    }
-
-    const next = drivers.map((d) =>
-      d.id === id ? { ...d, retirementDate: retirementDateInput } : d
-    );
-
-    setDrivers(next);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    localStorage.setItem(DRIVERS_INITIALIZED_KEY, "true");
-
-    if (session) {
-      const { data: master } = await supabase
-        .from("fleet_master")
-        .select("offices,course_settings")
-        .eq("id", "default")
-        .maybeSingle();
-
-      const { error } = await supabase.from("fleet_master").upsert({
-        id: "default",
-        offices: master?.offices ?? [],
-        drivers: next,
-        course_settings: master?.course_settings ?? [],
-        updated_by: session.user.id,
-        updated_at: new Date().toISOString(),
+  const showPin = async (driver: Driver) => {
+    if (visiblePins[driver.id]) {
+      setVisiblePins((old) => {
+        const next = { ...old };
+        delete next[driver.id];
+        return next;
       });
-
-      if (error) {
-        setMessage(`退職日の保存エラー：${error.message}`);
-        return;
-      }
-    }
-
-    setEditingRetirementId(null);
-    setRetirementDateInput("");
-    setMessage(`${target.name}の退職日を保存しました`);
-  };
-
-  const restoreDriver = async (id: number) => {
-    const target = drivers.find((d) => d.id === id);
-    if (!target || !confirm(`${target.name}を稼働ドライバーへ復帰させますか？`)) return;
-
-    const next = drivers.map((d) =>
-      d.id === id ? { ...d, status: "稼働" as const, retirementDate: "" } : d
-    );
-    setDrivers(next);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    localStorage.setItem(DRIVERS_INITIALIZED_KEY, "true");
-
-    if (!session) {
-      setMessage("ローカルで復帰しました。クラウド反映には管理者ログインが必要です");
       return;
     }
+    if (pinLoadingId !== null) return;
+    setPinLoadingId(driver.id);
+    setMessage("");
+    try {
+      const { data: auth, error: authError } = await supabase.auth.getSession();
+      if (authError || !auth.session?.access_token) throw new Error("管理者ログインが必要です。");
+      const response = await fetch("/api/admin/retired-pin", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${auth.session.access_token}`,
+        },
+        body: JSON.stringify({ driverId: driver.id }),
+        cache: "no-store",
+      });
+      const result: { pin?: string; error?: string } = await response.json();
+      if (!response.ok || !result.pin) throw new Error(result.error || "PINを取得できませんでした。");
+      setVisiblePins((old) => ({ ...old, [driver.id]: result.pin! }));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "PINの確認に失敗しました。");
+    } finally {
+      setPinLoadingId(null);
+    }
+  };
 
-    const { data: master } = await supabase
-      .from("fleet_master")
-      .select("offices,course_settings")
-      .eq("id", "default")
-      .maybeSingle();
+  const updateDriver = async (driver: Driver, patch: Partial<Driver>) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { data: auth } = await supabase.auth.getSession();
+      if (!auth.session) throw new Error("変更するには管理者ログインが必要です。");
+      const { data: master, error: readError } = await supabase.from("fleet_master")
+        .select("offices,drivers,course_settings").eq("id", "default").single();
+      if (readError) throw readError;
+      const current = Array.isArray(master?.drivers) ? master.drivers as Driver[] : [];
+      const target = current.find((d) => d.id === driver.id);
+      if (!target || target.status !== "退職") throw new Error("退職者データが更新されています。再読込してください。");
+      const next = current.map((d) => d.id === driver.id ? { ...d, ...patch } : d);
+      const { error } = await supabase.from("fleet_master").upsert({
+        id: "default", offices: master.offices, drivers: next,
+        course_settings: master.course_settings,
+        updated_by: auth.session.user.id, updated_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      setDrivers(next);
+      setVisiblePins({});
+      setMessage(`${driver.name}さんの情報を保存しました。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "保存に失敗しました。");
+    } finally { setBusy(false); }
+  };
 
-    const { error } = await supabase.from("fleet_master").upsert({
-      id: "default",
-      offices: master?.offices ?? [],
-      drivers: next,
-      course_settings: master?.course_settings ?? [],
-      updated_by: session.user.id,
-      updated_at: new Date().toISOString(),
-    });
-
-    setMessage(error ? `復帰エラー：${error.message}` : `${target.name}を復帰しました`);
+  const savePin = async (driver: Driver) => {
+    if (busy) return;
+    const pin = pinEdits[driver.id] ?? "";
+    if (!/^\d{4}$/.test(pin)) return setMessage("PINは数字4桁で入力してください。");
+    if (!confirm(`${driver.name}さんの共通PINを登録・変更しますか？`)) return;
+    setBusy(true);
+    try {
+      const { data: auth } = await supabase.auth.getSession();
+      if (!auth.session) throw new Error("PIN変更には管理者ログインが必要です。");
+      const { data: rows, error: readError } = await supabase.from("shift_driver_settings")
+        .select("id,driver_name");
+      if (readError) throw readError;
+      const matches = (rows ?? []).filter((r) => normalizeName(String(r.driver_name ?? "")) === normalizeName(driver.name));
+      if (matches.length > 1) throw new Error("同名の設定が複数あります。シフト設定を確認してください。");
+      if (matches.length === 1) {
+        const { error } = await supabase.from("shift_driver_settings")
+          .update({ pin_code: pin }).eq("id", matches[0].id);
+        if (error) throw error;
+      } else {
+        // 退職者で設定が消えている場合も、必要な初期値を付けて新規登録する。
+        const { error } = await supabase.from("shift_driver_settings").insert({
+          driver_name: driver.name,
+          office: driver.office || "営業所なし",
+          pin_code: pin,
+          fixed_days_off: [],
+          available_courses: [],
+          course_priorities: [],
+          auto_assign: false,
+        });
+        if (error) throw error;
+      }
+      setPinEdits((old) => ({ ...old, [driver.id]: "" }));
+      setVisiblePins((old) => { const next = { ...old }; delete next[driver.id]; return next; });
+      setMessage(`${driver.name}さんのPINを登録・更新しました。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "PIN変更に失敗しました。");
+    } finally { setBusy(false); }
   };
 
   return (
-    <main className="p-6">
-      <div className="mb-6 flex flex-wrap items-center gap-3">
+    <main className="mx-auto max-w-6xl p-6">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-bold">退職者リスト</h1>
-        <Link href="/drivers" className="ml-auto rounded bg-blue-600 px-4 py-2 font-semibold text-white">
-          ← ドライバー管理へ戻る
-        </Link>
+        <Link href="/drivers" className="rounded bg-slate-800 px-4 py-2 font-semibold text-white">← ドライバー管理に戻る</Link>
       </div>
-
-      <div className="mb-5 rounded-xl border bg-gray-50 p-3 text-sm">
-        退職者は通常のドライバー一覧には表示されません。復帰するとドライバー管理へ戻ります。
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <input className="min-w-64 flex-1 rounded border p-3" placeholder="名前・営業所・電話番号で検索" value={search} onChange={(e) => setSearch(e.target.value)} />
+        <button onClick={() => void load()} disabled={busy || loading} className="rounded border bg-white px-4 py-3 disabled:opacity-50">クラウドから再読込</button>
       </div>
-
-      <input
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        placeholder="氏名・営業所・日付を検索"
-        className="mb-4 w-full rounded border p-2"
-      />
-
-      {message && <div className="mb-4 font-semibold text-blue-700">{message}</div>}
-
-      <div className="overflow-x-auto">
-        <table className="min-w-[850px] w-full border-collapse border">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="border p-2">営業所</th>
-              <th className="border p-2">氏名</th>
-              <th className="border p-2">電話番号</th>
-              <th className="border p-2">勤務開始日</th>
-              <th className="border p-2">退職日</th>
-              <th className="border p-2">在籍期間</th>
-              <th className="border p-2">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {retiredDrivers.map((driver) => (
-              <tr key={driver.id}>
-                <td className="border p-2">{driver.office}</td>
-                <td className="border p-2 font-semibold">{driver.name}</td>
-                <td className="border p-2">{driver.phone}</td>
-                <td className="border p-2 text-center">{driver.startDate?.replaceAll("-", "/") || "未登録"}</td>
-                <td className="border p-2 text-center">
-                  {editingRetirementId === driver.id ? (
-                    <div className="flex min-w-[190px] items-center gap-2">
-                      <input
-                        type="date"
-                        value={retirementDateInput}
-                        min={driver.startDate || undefined}
-                        onChange={(e) => setRetirementDateInput(e.target.value)}
-                        className="min-w-0 flex-1 rounded border p-1.5"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => saveRetirementDate(driver.id)}
-                        className="rounded bg-blue-600 px-2 py-1.5 font-semibold text-white"
-                      >
-                        保存
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex items-center justify-center gap-2">
-                      <span>{driver.retirementDate?.replaceAll("-", "/") || "未登録"}</span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditingRetirementId(driver.id);
-                          setRetirementDateInput(driver.retirementDate ?? "");
-                        }}
-                        className="rounded bg-orange-500 px-2 py-1 text-xs font-semibold text-white"
-                      >
-                        {driver.retirementDate ? "変更" : "登録"}
-                      </button>
-                    </div>
-                  )}
-                </td>
-                <td className="border p-2 text-center font-semibold">{getTenure(driver.startDate, driver.retirementDate)}</td>
-                <td className="border p-2 text-center">
-                  <div className="flex justify-center gap-2">
-                    {editingRetirementId === driver.id && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditingRetirementId(null);
-                          setRetirementDateInput("");
-                        }}
-                        className="rounded border px-3 py-1 font-semibold"
-                      >
-                        キャンセル
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => restoreDriver(driver.id)}
-                      className="rounded bg-green-600 px-3 py-1 font-semibold text-white"
-                    >
-                      復帰
+      {message && <p className="mb-4 rounded border bg-slate-50 p-3 text-sm">{message}</p>}
+      <p className="mb-3 text-sm text-gray-600">退職者 {retired.length}名 ／ 在籍期間は15日以上の端数を1ヶ月に切り上げ</p>
+      {loading ? <p>読み込み中…</p> : retired.length === 0 ? <p className="rounded border p-6 text-center">退職者は登録されていません。</p> : (
+        <div className="space-y-4">
+          {retired.map((driver) => (
+            <section key={driver.id} className="rounded-xl border bg-white p-4 shadow-sm">
+              <div className="mb-3 flex flex-wrap items-center gap-3">
+                <h2 className="text-lg font-bold">{driver.name}</h2>
+                <span className="rounded bg-gray-200 px-2 py-1 text-xs">{driver.office}</span>
+                <span className="text-sm text-gray-500">{driver.phone || "電話番号未登録"}</span>
+              </div>
+              <div className="mb-4 grid gap-3 sm:grid-cols-3">
+                <div><p className="text-xs text-gray-500">勤務開始日</p><p>{driver.startDate || "未登録"}</p></div>
+                <div><p className="text-xs text-gray-500">退職日</p><p>{driver.retirementDate || "未登録"}</p></div>
+                <div><p className="text-xs text-gray-500">在籍期間</p><p className="font-semibold">{tenure(driver.startDate, driver.retirementDate)}</p></div>
+              </div>
+              <div className="flex flex-wrap items-end gap-3 border-t pt-4">
+                <label className="text-sm">退職日を変更
+                  <input type="date" className="mt-1 block rounded border p-2" value={dateEdits[driver.id] ?? driver.retirementDate ?? ""} onChange={(e) => setDateEdits((old) => ({ ...old, [driver.id]: e.target.value }))} />
+                </label>
+                <button disabled={busy} className="rounded bg-blue-600 px-4 py-2 text-white disabled:opacity-50" onClick={() => {
+                  const date = dateEdits[driver.id] ?? driver.retirementDate ?? "";
+                  if (!date || (driver.startDate && date < driver.startDate)) return setMessage("退職日は勤務開始日以降の日付を入力してください。");
+                  void updateDriver(driver, { retirementDate: date });
+                }}>退職日を保存</button>
+                <button disabled={busy} className="rounded bg-green-600 px-4 py-2 text-white disabled:opacity-50" onClick={() => {
+                  if (confirm(`${driver.name}さんを稼働中のドライバーとして復帰させますか？`)) void updateDriver(driver, { status: "稼働", retirementDate: "" });
+                }}>復帰する</button>
+              </div>
+              <div className="mt-4 flex flex-wrap items-end gap-3 border-t pt-4">
+                <div className="text-sm">
+                  <p className="mb-1">現在の4桁PIN（管理者のみ）</p>
+                  <div className="flex items-center gap-3">
+                    <span className="inline-block min-w-20 rounded border bg-slate-50 px-3 py-2 text-center font-mono text-lg font-bold tracking-widest">
+                      {visiblePins[driver.id] ?? "••••"}
+                    </span>
+                    <button type="button" disabled={pinLoadingId !== null} onClick={() => void showPin(driver)} className="rounded border bg-white px-3 py-2 disabled:opacity-50">
+                      {pinLoadingId === driver.id ? "確認中…" : visiblePins[driver.id] ? "隠す" : "PINを確認"}
                     </button>
                   </div>
-                </td>
-              </tr>
-            ))}
-            {retiredDrivers.length === 0 && (
-              <tr><td colSpan={7} className="border p-5 text-center text-gray-500">退職者はいません</td></tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+                </div>
+                <label className="text-sm">4桁PINを再設定
+                  <input type="password" inputMode="numeric" maxLength={4} autoComplete="new-password" placeholder="新しい4桁" className="mt-1 block w-40 rounded border p-2" value={pinEdits[driver.id] ?? ""} onChange={(e) => setPinEdits((old) => ({ ...old, [driver.id]: e.target.value.replace(/\D/g, "").slice(0, 4) }))} />
+                </label>
+                <button disabled={busy} className="rounded bg-orange-500 px-4 py-2 text-white disabled:opacity-50" onClick={() => void savePin(driver)}>PINを変更</button>
+                <span className="text-xs text-gray-500">シフト共有・支払明細と共通のPINです。</span>
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
     </main>
   );
 }

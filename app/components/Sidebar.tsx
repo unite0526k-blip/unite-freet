@@ -6,9 +6,11 @@ import { usePathname } from "next/navigation";
 
 export default function Sidebar() {
   const pathname = usePathname();
+
   if (pathname === "/handover/share") {
     return null;
   }
+
   const menuItems = [
     {
       href: "/",
@@ -27,8 +29,12 @@ export default function Sidebar() {
       label: "📅 シフト管理",
     },
     {
-     href: "/handover/share",
+      href: "/handover/share",
       label: "📒 コース別引き継ぎノート",
+    },
+    {
+      href: "/payment",
+      label: "📄 支払明細管理",
     },
     {
       href: "/settings",
