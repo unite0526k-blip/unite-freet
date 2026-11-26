@@ -10,7 +10,10 @@ import DriverCalendar from "./DriverCalendar";
 
 const supabase = maybeSupabase!;
 
-type Region = "松阪" | "伊勢" | "伊賀";
+type Region = string;
+const DEFAULT_REGIONS: Region[] = ["松阪", "伊勢", "伊賀"];
+const emptyOfficeCourses = (regions: Region[]): Record<Region, Course[]> =>
+  Object.fromEntries(regions.map((region) => [region, [] as Course[]]));
 type CourseStatus = "配車済" | "未配車" | "応援" | "休み";
 
 type Course = {
@@ -154,11 +157,11 @@ const createCoursesFromSettings = (
   settings: CourseSetting[],
 ): Record<Region, Course[]> => {
   const weekday = new Date(`${dateValue}T00:00:00`).getDay();
-  const result = { 松阪: [], 伊勢: [], 伊賀: [] } as Record<Region, Course[]>;
+  const result = emptyOfficeCourses(Array.from(new Set([...DEFAULT_REGIONS, ...settings.map((item) => item.region)])));
   settings
     .filter((setting) => !setting.closedWeekdays.includes(weekday))
     .forEach((setting, index) => {
-      result[setting.region].push(
+      (result[setting.region] ??= []).push(
         createCourse(Date.now() + index, setting.name),
       );
     });
@@ -170,7 +173,7 @@ const getCourseNamesForDate = (
   region: Region,
   preset: "normal" | "weekday",
 ) => {
-  if (preset === "normal") return NORMAL_COURSE_NAMES[region];
+  if (preset === "normal") return NORMAL_COURSE_NAMES[region] ?? [];
 
   const weekday = new Date(`${dateValue}T00:00:00`).getDay();
 
@@ -194,7 +197,7 @@ const getCourseNamesForDate = (
     return ["神久コース", "御薗・高向コース"];
   }
 
-  return NORMAL_COURSE_NAMES[region];
+  return NORMAL_COURSE_NAMES[region] ?? [];
 };
 
 const resolveCourseNamesForDate = (
@@ -212,7 +215,7 @@ const resolveCourseNamesForDate = (
     .filter((setting) => setting.region === region)
     .filter(
       (setting) =>
-        !NORMAL_COURSE_NAMES[region].some((name) =>
+        !(NORMAL_COURSE_NAMES[region] ?? []).some((name) =>
           sameCourseName(name, setting.name),
         ),
     )
@@ -299,9 +302,7 @@ const canDriveCourse = (
 };
 const normalizeRegion = (office: string): Region | null => {
   const region = office.replace("営業所", "");
-  return region === "松阪" || region === "伊勢" || region === "伊賀"
-    ? region
-    : null;
+  return region.trim() || null;
 };
 
 const getSupportedCoursesForRegion = (
@@ -430,6 +431,13 @@ const statusStyles: Record<CourseStatus, string> = {
 // ドライバー名比較用：半角・全角スペースを無視する
 const normalizeDriverName = (value: string) => value.replace(/[\s　]/g, "");
 
+// 空き枠（未割当）と、その日のコース自体が非稼働である状態を区別する。
+const NON_OPERATING_VALUE = "__non_operating__";
+const isNonOperatingCourse = (course: Course) =>
+  course.status === "休み" && course.memo === "非稼働";
+const courseSelectValue = (course: Course) =>
+  isNonOperatingCourse(course) ? NON_OPERATING_VALUE : course.driver;
+
 // 退職日は最終在籍日。保存済みの配置はこの判定で削除しない。
 const employmentDate = (value?: string) => {
   const date = String(value ?? "").slice(0, 10).replace(/\//g, "-");
@@ -454,6 +462,9 @@ export default function ShiftPage() {
   );
   const [localDataReady, setLocalDataReady] = useState(false);
   const [activeTab, setActiveTab] = useState<Region>("松阪");
+  const [registeredOffices, setRegisteredOffices] = useState<Region[]>(DEFAULT_REGIONS);
+  // 月間シフト表専用の営業所切替（他の画面の営業所選択とは独立）
+  const [monthlyRegion, setMonthlyRegion] = useState<Region>("松阪");
   const [selectedWeek, setSelectedWeek] = useState(0);
   const [coursePreset, setCoursePreset] = useState<"normal" | "weekday">(
     "normal",
@@ -633,6 +644,21 @@ export default function ShiftPage() {
   const [masterDrivers, setMasterDrivers] = useState<DriverItem[]>(
     initialStandbyDrivers,
   );
+  const allRegions = useMemo(() => Array.from(new Set([
+    ...DEFAULT_REGIONS,
+    ...registeredOffices,
+    ...courseSettings.map((setting) => normalizeRegion(setting.region)),
+    ...masterDrivers.map((driver) => normalizeRegion(driver.area)),
+    ...masterDrivers.map((driver) => normalizeRegion(driver.mainArea ?? "")),
+    ...Object.keys(NORMAL_COURSE_NAMES),
+  ].filter((region): region is Region => Boolean(region)))),
+    [registeredOffices, courseSettings, masterDrivers]);
+
+  useEffect(() => {
+    if (!allRegions.includes(activeTab)) setActiveTab(allRegions[0] ?? "松阪");
+    if (!allRegions.includes(monthlyRegion)) setMonthlyRegion(allRegions[0] ?? "松阪");
+  }, [allRegions, activeTab, monthlyRegion]);
+
   const standbyDrivers = useMemo(() => masterDrivers.filter((driver) =>
     employedDuring(driver, `${autoMonth}-01`, `${autoMonth}-31`)
   ), [masterDrivers, autoMonth]);
@@ -701,7 +727,10 @@ export default function ShiftPage() {
         setCourseSettings(cloudCourses);
         saveData("unite-fleet-course-settings", cloudCourses);
       }
-      if (cloudOffices?.length) saveData("unite-fleet-offices", cloudOffices);
+      if (cloudOffices?.length) {
+        saveData("unite-fleet-offices", cloudOffices);
+        setRegisteredOffices(cloudOffices.map((office) => normalizeRegion(office)).filter((office): office is Region => Boolean(office)));
+      }
       if (cloudFixedDaysOff) {
         setFixedDaysOff(cloudFixedDaysOff);
         saveData("unite-fleet-fixed-days-off", cloudFixedDaysOff);
@@ -878,6 +907,8 @@ export default function ShiftPage() {
     setDailyCourseOverrides(
       loadData<DailyCourseOverrides>("unite-fleet-daily-course-overrides", {}),
     );
+    const savedOffices = loadData<string[]>("unite-fleet-offices", []);
+    if (savedOffices.length > 0) setRegisteredOffices(savedOffices.map((office) => normalizeRegion(office)).filter((office): office is Region => Boolean(office)));
     const savedCourseSettings = loadData<CourseSetting[]>(
       "unite-fleet-course-settings",
       DEFAULT_COURSE_SETTINGS,
@@ -1020,11 +1051,11 @@ export default function ShiftPage() {
       for (let day = 1; day <= lastDay; day += 1) {
         const date = `${autoMonth}-${String(day).padStart(2, "0")}`;
         const currentDay =
-          next[date] ?? ({ 松阪: [], 伊勢: [], 伊賀: [] } as Record<Region, Course[]>);
+          next[date] ?? emptyOfficeCourses(allRegions);
 
         const rebuilt = { ...currentDay };
 
-        (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
+        allRegions.forEach((region) => {
           // 手動の「その日だけコース変更」があれば最優先。
           // 無ければ、今回選んだ通常版／曜日版を使う。
           const names = resolveCourseNamesForDate(
@@ -1059,7 +1090,7 @@ export default function ShiftPage() {
 
   const selectableCourseNames = Array.from(
     new Set([
-      ...NORMAL_COURSE_NAMES[activeTab],
+      ...(NORMAL_COURSE_NAMES[activeTab] ?? []),
       ...courseSettings
         .filter((setting) => setting.region === activeTab)
         .map((setting) => setting.name),
@@ -1114,9 +1145,85 @@ const orderedNames = Array.from(
     );
   };
 
+  // 前月末6日：端末に前月を開いていなくてもクラウドの保存済み配置を照会する。
+  // クラウド取得に失敗した場合は「0勤務」と推測せず、作成・変更を停止する。
+  const [previousMonthSafety, setPreviousMonthSafety] = useState<{
+    month: string;
+    worked: Record<string, string[]>;
+  } | null>(null);
+
+  const fetchPreviousMonthSafety = async (monthKey: string) => {
+    const [targetYear, targetMonth] = monthKey.split("-").map(Number);
+    const previousMonth = `${new Date(targetYear, targetMonth - 2, 1).getFullYear()}-${String(new Date(targetYear, targetMonth - 2, 1).getMonth() + 1).padStart(2, "0")}`;
+    const sixDates = Array.from({ length: 6 }, (_, index) =>
+      formatDateKey(new Date(targetYear, targetMonth - 1, index - 5)),
+    );
+    const worked: Record<string, string[]> = {};
+    // 端末保存を候補にする。クラウド保存があれば後でクラウドを正本とする。
+    for (const date of sixDates) {
+      worked[date] = Object.values(shiftsByDate[date] ?? {}).flat()
+        .filter((course) => Boolean(course.driver))
+        .map((course) => normalizeDriverName(course.driver));
+    }
+    if (!session) {
+      // 未ログイン時に欠損の可能性がある前月データを0勤務と誤認しない。
+      throw new Error("前月シフト確認には管理者ログインが必要です。");
+    }
+    const { data: published, error: publishedError } = await supabase
+      .from("shift_months").select("id")
+      .eq("month_key", previousMonth).eq("status", "published")
+      .limit(1).maybeSingle();
+    if (publishedError) throw new Error(`前月確認エラー：${publishedError.message}`);
+    let monthId = published?.id;
+    if (!monthId) {
+      const { data: drafts, error: draftError } = await supabase
+        .from("shift_months").select("id")
+        .eq("month_key", previousMonth).eq("status", "draft").limit(1);
+      if (draftError) throw new Error(`前月確認エラー：${draftError.message}`);
+      monthId = drafts?.[0]?.id;
+    }
+    if (monthId) {
+      const { data: assignments, error: assignmentError } = await supabase
+        .from("shift_assignments").select("work_date,driver_name")
+        .eq("shift_month_id", monthId)
+        .gte("work_date", sixDates[0])
+        .lte("work_date", sixDates[5]).range(0, 4999);
+      if (assignmentError) throw new Error(`前月配置読込エラー：${assignmentError.message}`);
+      // クラウドが存在する場合、その月の末尾6日間はクラウドの情報を使用。
+      sixDates.forEach((date) => { worked[date] = []; });
+      (assignments ?? []).forEach((row) => {
+        const date = String(row.work_date).slice(0, 10);
+        const name = String(row.driver_name ?? "");
+        if (worked[date] && name) worked[date].push(normalizeDriverName(name));
+      });
+    }
+    const result = { month: monthKey, worked };
+    setPreviousMonthSafety(result);
+    return result;
+  };
+
+  useEffect(() => {
+    if (!session || !/^\d{4}-\d{2}$/.test(autoMonth)) return;
+    let cancelled = false;
+    setPreviousMonthSafety(null);
+    void fetchPreviousMonthSafety(autoMonth).catch(() => {
+      if (!cancelled) setPreviousMonthSafety(null);
+    });
+    return () => { cancelled = true; };
+    // 前月クラウド確認は対象月・ログインが切り替わった時に更新する。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoMonth, session?.user.id]);
+
   const generateMonthlyShifts = async () => {
     const [year, month] = autoMonth.split("-").map(Number);
     const lastDay = new Date(year, month, 0).getDate();
+    let previousSafety: Awaited<ReturnType<typeof fetchPreviousMonthSafety>>;
+    try {
+      previousSafety = await fetchPreviousMonthSafety(autoMonth);
+    } catch (error) {
+      setAutoMessage(`自動作成を中止しました。${error instanceof Error ? error.message : "前月の勤務を確認できません"}`);
+      return;
+    }
         setAutoMessage("登録済みの希望休を読み込み中...");
 
     const { data: dayOffRows, error: dayOffError } = await supabase
@@ -1202,11 +1309,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
       ""
     ) as Region;
 
-    if (
-      region === "松阪" ||
-      region === "伊勢" ||
-      region === "伊賀"
-    ) {
+    if (normalizeRegion(region)) {
       regions.add(region);
     }
   });
@@ -1254,7 +1357,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
       );
     };
     const requiredCourseCountByRegion = new Map<Region, number>(
-      (["松阪", "伊勢", "伊賀"] as Region[]).map((region) => [
+      allRegions.map((region) => [
         region,
         (() => {
           let total = 0;
@@ -1281,7 +1384,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
     const generationTargetKey = (region: Region, driverName: string) =>
       `${region}|${normalizeDriverName(driverName)}`;
 
-    const regionsForGeneration: Region[] = ["松阪", "伊勢", "伊賀"];
+    const regionsForGeneration: Region[] = allRegions;
 
     uniqueDrivers.forEach((driver) => {
       regionsForGeneration.forEach((region) => {
@@ -1351,6 +1454,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
           targetRegion,
           coursePreset,
           dailyCourseOverrides[date]?.[targetRegion],
+          courseSettings,
         ).forEach((courseName) => monthlyCourses.add(courseName));
       }
 
@@ -1362,10 +1466,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
             .filter((driver) => {
               const rawMain =
                 driver.mainArea ?? driver.area.replace("営業所", "");
-              const mainRegion: Region =
-                rawMain === "伊勢" || rawMain === "伊賀"
-                  ? rawMain
-                  : "松阪";
+              const mainRegion: Region = normalizeRegion(rawMain) ?? allRegions[0] ?? "松阪";
 
               if (mainRegion === targetRegion) return false;
               if (!getDriverOfficeTabs(driver).includes(targetRegion))
@@ -1498,10 +1599,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
       return formatDateKey(date);
     });
     const workedInPreviousMonth = (driverName: string, dateKey: string) =>
-      Object.values(shiftsByDate[dateKey] ?? {}).flat().some(
-        (course) => Boolean(course.driver) &&
-          normalizeDriverName(course.driver) === normalizeDriverName(driverName),
-      );
+      (previousSafety.worked[dateKey] ?? []).includes(normalizeDriverName(driverName));
     const previousWorkedDates = (driverName: string) =>
       previousSixDates.filter((dateKey) => workedInPreviousMonth(driverName, dateKey));
     const previousAndCurrentDates = (currentDates: string[]) =>
@@ -1551,15 +1649,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
       for (let daysBack = 1; daysBack <= 6; daysBack += 1) {
         const previousDate = new Date(firstDayOfMonth);
         previousDate.setDate(firstDayOfMonth.getDate() - daysBack);
-        const previousCourses = Object.values(
-          shiftsByDate[formatDateKey(previousDate)] ?? {},
-        ).flat();
-        const worked = previousCourses.some(
-          (course) =>
-            course.driver &&
-            normalizeDriverName(course.driver) ===
-              normalizeDriverName(driver.name),
-        );
+        const worked = workedInPreviousMonth(driver.name, formatDateKey(previousDate));
 
         if (!worked) break;
         previousMonthStreak += 1;
@@ -1696,7 +1786,7 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
     for (let day = 1; day <= lastDay; day += 1) {
       const date = `${autoMonth}-${String(day).padStart(2, "0")}`;
       const weekday = new Date(`${date}T00:00:00`).getDay();
-      const courses = createCoursesFromSettings(date, courseSettings);
+      const courses = { ...emptyOfficeCourses(allRegions), ...createCoursesFromSettings(date, courseSettings) };
 
       (Object.keys(courses) as Region[]).forEach((region, regionIndex) => {
         const courseNames = resolveCourseNamesForDate(
@@ -1733,19 +1823,25 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
             assignedToday.add(locked.driver);
             return locked;
           }
+          // 手動設定した非稼働枠は再自動作成しても埋めない。
+          if (locked && isNonOperatingCourse(locked)) return locked;
           return course;
         });
       });
 
-      // 専属人数が少ない営業所から先に確保する。
-      // 松阪を先にすると、複数営業所対応者を使い切って伊勢が空くため。
-      (["伊勢", "伊賀", "松阪"] as Region[]).forEach((region) => {
+      // 【メイン営業所優先】まず全営業所で所属ドライバーのみを配置し、
+      // その後、まだ未配置のコースだけをサブ営業所の応援ドライバーで補う。
+      // 営業所を一つずつ完成させると、伊勢が松阪所属者を先取りしてしまう。
+      (["main", "sub"] as const).forEach((assignmentPhase) => {
+      allRegions.forEach((region) => {
         const originalCourseOrder = new Map(
           courses[region].map((course, index) => [course.course, index]),
         );
         const availableDriverCount = (course: Course) =>
           uniqueDrivers.filter((driver) => {
             if (!eligibleRegions.get(driver.name)?.has(region)) return false;
+            if (assignmentPhase === "main" && driver.mainArea !== region) return false;
+            if (assignmentPhase === "sub" && driver.mainArea === region) return false;
             if (
               isAutoExcludedForGeneration(driver) &&
               normalizeDriverName(driver.name) !==
@@ -1830,7 +1926,8 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
             return assignmentPriority(a) - assignmentPriority(b);
           })
           .map((course) => {
-            if (course.isLocked && course.driver) return course;
+            // 第1段階で配置済みのコースは第2段階で上書きしない。
+            if (course.driver) return course;
             const courseSetting = courseSettings.find(
               (setting) =>
                 setting.region === region && setting.name === course.course,
@@ -1840,6 +1937,10 @@ coursePriorityMap.forEach((priorities, normalizedName) => {
             );
             const unavailableReasons = (driver: DriverItem) => {
               const reasons: string[] = [];
+              if (assignmentPhase === "main" && driver.mainArea !== region)
+                reasons.push("サブ所属（後半で判定）");
+              if (assignmentPhase === "sub" && driver.mainArea === region)
+                reasons.push("メイン所属（前半で判定）");
               if (
                 isAutoExcludedForGeneration(driver) &&
                 normalizeDriverName(driver.name) !==
@@ -2015,7 +2116,7 @@ const coursePriorityPenalty =
                         // 横溝・楠滝・徳田などの余裕日数を応援へ回す。
                         return (
                           actualTotal * 100 -
-                          shortage * (driver.mainArea !== region ? 2200 : 900)
+                          shortage * 900
                         );
                       })()
                     : 0;
@@ -2158,7 +2259,7 @@ const coursePriorityPenalty =
 
             const selected = candidates[0];
             if (!selected) {
-              unassignedCount += 1;
+              // まだサブ応援で埋まる可能性があるため、未配置数は2段階終了後に集計。
               const reasonCounts = new Map<string, number>();
               regionalDrivers.forEach((driver) =>
                 unavailableReasons(driver).forEach((reason) =>
@@ -2201,6 +2302,9 @@ const coursePriorityPenalty =
               (originalCourseOrder.get(b.course) ?? 999),
           );
       });
+      }); // メイン→サブの2段階配置
+      unassignedCount += (Object.values(courses) as Course[][])
+        .flat().filter((course) => !course.driver).length;
 
       getUniqueDrivers().forEach((driver: DriverItem) => {
         streaks.set(
@@ -2322,7 +2426,7 @@ const coursePriorityPenalty =
             `${autoMonth}-${String(repairDay).padStart(2, "0")}`;
           const weekday = new Date(`${dateKey}T00:00:00`).getDay();
 
-          for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+          for (const region of allRegions) {
             const dayCourses = generated[dateKey]?.[region] ?? [];
 
             for (
@@ -2654,7 +2758,7 @@ const coursePriorityPenalty =
           const targetDate =
             `${autoMonth}-${String(targetDay).padStart(2, "0")}`;
 
-          for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+          for (const region of allRegions) {
             if (!targetPlanCompleteByRegion.get(region)) continue;
 
             const targetCourses = generated[targetDate]?.[region] ?? [];
@@ -2845,7 +2949,7 @@ const coursePriorityPenalty =
           const targetDate =
             `${autoMonth}-${String(targetDay).padStart(2, "0")}`;
 
-          for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+          for (const region of allRegions) {
             if (!targetPlanCompleteByRegion.get(region)) continue;
 
             const targetCourses = generated[targetDate]?.[region] ?? [];
@@ -3341,7 +3445,7 @@ const coursePriorityPenalty =
       for (let rebalancePass = 0; rebalancePass < lastDay; rebalancePass += 1) {
         let rebalancedInPass = 0;
 
-        for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+        for (const region of allRegions) {
           const underTargetDrivers = uniqueDrivers
             .filter((driver) => {
               if (!hasGenerationTargetWorkDays(region, driver.name))
@@ -3459,7 +3563,7 @@ const coursePriorityPenalty =
         let filledInPass = 0;
         for (let day = 1; day <= lastDay; day += 1) {
           const dateKey = `${autoMonth}-${String(day).padStart(2, "0")}`;
-          for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+          for (const region of allRegions) {
             const dayCourses = generated[dateKey]?.[region] ?? [];
             dayCourses.forEach((course, courseIndex) => {
               if (course.driver || course.isLocked) return;
@@ -3508,7 +3612,7 @@ const coursePriorityPenalty =
         let fixedInPass = 0;
         for (let missingDay = 1; missingDay <= lastDay; missingDay += 1) {
           const missingDate = `${autoMonth}-${String(missingDay).padStart(2, "0")}`;
-          for (const region of ["松阪", "伊勢", "伊賀"] as Region[]) {
+          for (const region of allRegions) {
             const missingCourses = generated[missingDate]?.[region] ?? [];
             for (
               let missingIndex = 0;
@@ -3597,7 +3701,7 @@ const coursePriorityPenalty =
       // 上の置換後の実績を採点へ正しく反映する。
       uniqueDrivers.forEach((driver) => {
         workCounts.set(driver.name, countActualWorkedDates(driver.name).size);
-        (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
+        allRegions.forEach((region) => {
           let regionalDays = 0;
           for (let d = 1; d <= lastDay; d += 1) {
             const key = `${autoMonth}-${String(d).padStart(2, "0")}`;
@@ -3621,7 +3725,7 @@ const coursePriorityPenalty =
         `${autoMonth}-${String(index + 1).padStart(2, "0")}`,
       );
       const allMonthSlots = () => monthKeys.flatMap((dateKey) =>
-        (["松阪", "伊勢", "伊賀"] as Region[]).flatMap((region) =>
+        allRegions.flatMap((region) =>
           (generated[dateKey]?.[region] ?? []).map((course) => ({ dateKey, region, course })),
         ),
       );
@@ -3940,7 +4044,7 @@ const coursePriorityPenalty =
       });
 
       let targetMismatchCount = 0;
-      (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
+      allRegions.forEach((region) => {
         if (!targetPlanCompleteByRegion.get(region)) return;
 
         uniqueDrivers.forEach((driver) => {
@@ -3989,7 +4093,7 @@ const coursePriorityPenalty =
     const safetyDates = Array.from({ length: lastDay }, (_, i) =>
       `${autoMonth}-${String(i + 1).padStart(2, "0")}`,
     );
-    const safetyRegions: Region[] = ["松阪", "伊勢", "伊賀"];
+    const safetyRegions: Region[] = allRegions;
     const slotsForDriverOnDate = (name: string, dateKey: string) =>
       safetyRegions.flatMap((region) =>
         (selectedGenerated[dateKey]?.[region] ?? [])
@@ -4072,7 +4176,7 @@ const coursePriorityPenalty =
       warnings.push(`7連勤以上が${bestSevenDayStreakCount}件`);
 
     const selectedTargetShortages: string[] = [];
-    (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
+    allRegions.forEach((region) => {
       uniqueDrivers.forEach((driver) => {
         if (!hasGenerationTargetWorkDays(region, driver.name)) return;
         const target = getGenerationTargetWorkDays(region, driver.name);
@@ -4136,9 +4240,11 @@ const coursePriorityPenalty =
           ? {
             
               ...course,
-              driver: driverName,
-              status: driverName ? "配車済" : "未配車",
-memo: driverName ? "手動変更" : "",            }
+              driver: driverName === NON_OPERATING_VALUE ? "" : driverName,
+              status: driverName === NON_OPERATING_VALUE ? "休み" : driverName ? "配車済" : "未配車",
+              memo: driverName === NON_OPERATING_VALUE ? "非稼働" : driverName ? "手動変更" : "",
+              isLocked: driverName === NON_OPERATING_VALUE ? true : course.isLocked,
+            }
           : course,
       ),
     }));
@@ -4149,9 +4255,20 @@ const changeMonthlyCourseDriver = async (
   courseId: number,
   driverName: string,
 ) => {
+  const isNonOperating = driverName === NON_OPERATING_VALUE;
+  const assignedDriverName = isNonOperating ? "" : driverName;
+  let previousSafetyForManual: Awaited<ReturnType<typeof fetchPreviousMonthSafety>> | null = null;
+  if (assignedDriverName) {
+    try {
+      previousSafetyForManual = await fetchPreviousMonthSafety(autoMonth);
+    } catch (error) {
+      window.alert(`前月末の連勤確認ができないため変更を中止しました：${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+  }
   const selectedDriver = standbyDrivers.find(
     (driver) =>
-      normalizeDriverName(driver.name) === normalizeDriverName(driverName) &&
+      normalizeDriverName(driver.name) === normalizeDriverName(assignedDriverName) &&
       driver.area.replace("営業所", "") === region,
   );
   if (selectedDriver && !employedDuring(selectedDriver, dateKey, dateKey)) {
@@ -4163,7 +4280,7 @@ const changeMonthlyCourseDriver = async (
 ).find((course) => course.id === courseId);
 
 if (
-  driverName &&
+  assignedDriverName &&
   targetCourse &&
   selectedDriver &&
   !(
@@ -4182,7 +4299,7 @@ if (
   );
   return;
 }
-if (driverName) {
+if (assignedDriverName) {
   const {
     data: manualDayOffRows,
     error: manualDayOffError,
@@ -4212,7 +4329,7 @@ if (driverName) {
     return;
   }
 }
-if (driverName) {
+if (assignedDriverName) {
   const duplicateAssignment = Object.entries(
     shiftsByDate[dateKey] ?? {},
   ).some(([assignedRegion, courses]) =>
@@ -4233,7 +4350,7 @@ course.driver.replace(/[\s　]/g, "") ===
     return;
   }
 }
-if (driverName) {
+if (assignedDriverName) {
   const normalizedDriverName = driverName.replace(/[\s　]/g, "");
   const workedDates = new Set<string>();
 
@@ -4256,16 +4373,25 @@ if (driverName) {
   );
 
   workedDates.add(dateKey);
+  // 前月の直近6勤務を判定対象に含める。
+  Object.entries(previousSafetyForManual?.worked ?? {}).forEach(([date, names]) => {
+    if (names.includes(normalizedDriverName)) workedDates.add(date);
+  });
 
   const [year, month] = autoMonth.split("-").map(Number);
   const lastDay = new Date(year, month, 0).getDate();
   let consecutiveDates: string[] = [];
   let createsSevenDayStreak = false;
 
-  for (let day = 1; day <= lastDay; day += 1) {
-    const workDate =
-      `${autoMonth}-${String(day).padStart(2, "0")}`;
-
+  const previousSix = Array.from({ length: 6 }, (_, index) =>
+    formatDateKey(new Date(year, month - 1, index - 5)),
+  );
+  const datesToCheck = [
+    ...previousSix,
+    ...Array.from({ length: lastDay }, (_, index) =>
+      `${autoMonth}-${String(index + 1).padStart(2, "0")}`),
+  ];
+  for (const workDate of datesToCheck) {
     if (workedDates.has(workDate)) {
       consecutiveDates.push(workDate);
 
@@ -4296,9 +4422,10 @@ if (driverName) {
         course.id === courseId
           ? {
               ...course,
-              driver: driverName,
-              status: driverName ? "配車済" : "未配車",
-memo: driverName ? "手動変更" : "",              isLocked: true,
+              driver: assignedDriverName,
+              status: isNonOperating ? "休み" : assignedDriverName ? "配車済" : "未配車",
+              memo: isNonOperating ? "非稼働" : assignedDriverName ? "手動変更" : "",
+              isLocked: true,
             }
           : course,
       ),
@@ -4323,11 +4450,9 @@ const driverWorkedOnDate = (
 // 各営業所内では同じ日に複数コースへ入っていても1日として数える。
 const getMonthlyWorkBreakdown = (driverName: string) => {
   const normalizedDriverName = normalizeDriverName(driverName);
-  const workedDatesByRegion: Record<Region, Set<string>> = {
-    松阪: new Set<string>(),
-    伊勢: new Set<string>(),
-    伊賀: new Set<string>(),
-  };
+  const workedDatesByRegion: Record<Region, Set<string>> = Object.fromEntries(
+    allRegions.map((region) => [region, new Set<string>()]),
+  );
 
   Object.entries(shiftsByDate).forEach(([dateKey, regionShifts]) => {
     if (!dateKey.startsWith(`${autoMonth}-`)) return;
@@ -4342,20 +4467,16 @@ const getMonthlyWorkBreakdown = (driverName: string) => {
           normalizeDriverName(course.driver) === normalizedDriverName,
       );
 
-      if (workedInRegion) workedDatesByRegion[region].add(dateKey);
+      if (workedInRegion) (workedDatesByRegion[region] ??= new Set<string>()).add(dateKey);
     });
   });
 
-  const matsusaka = workedDatesByRegion.松阪.size;
-  const ise = workedDatesByRegion.伊勢.size;
-  const iga = workedDatesByRegion.伊賀.size;
-
-  return {
-    松阪: matsusaka,
-    伊勢: ise,
-    伊賀: iga,
-    total: matsusaka + ise + iga,
-  };
+  const counts: Record<string, number> = Object.fromEntries(
+    Object.entries(workedDatesByRegion).map(([region, dates]) => [region, dates.size]),
+  );
+  return { ...counts, total: new Set(
+    Object.values(workedDatesByRegion).flatMap((dates) => Array.from(dates)),
+  ).size };
 };
 
 const getMonthlyWorkCount = (driverName: string) =>
@@ -4383,7 +4504,7 @@ const getMonthlyWorkDisplayParts = (driverName: string) => {
   return {
     total: `${work.total}日`,
     breakdown: officeTabs
-      .map((region) => `${region}${work[region]}`)
+      .map((region) => `${region}${(work as Record<string, number>)[region] ?? 0}`)
       .join("・"),
   };
 };
@@ -4446,11 +4567,16 @@ const displayedDateKeys = monthlyDateKeys.slice(
 // これで A〜H + 追加コース（例: 高町）のシンプルな表を維持する。
 const monthlyCourseNames = uniqueCourseNames([
   ...courseSettings
-    .filter((setting) => setting.region === activeTab)
+    .filter((setting) => setting.region === monthlyRegion)
     .map((setting) => setting.name),
 
   ...monthlyDateKeys.flatMap(
-    (date) => dailyCourseOverrides[date]?.[activeTab] ?? []
+    (date) => dailyCourseOverrides[date]?.[monthlyRegion] ?? []
+  ),
+  ...monthlyDateKeys.flatMap(
+    (date) => (shiftsByDate[date]?.[monthlyRegion] ?? [])
+      .map((course) => course.course)
+      .filter((name) => !["AB", "BC", "CD", "神久・朝熊", "御薗・高向"].includes(normalizeCourseName(name)))
   ),
 ]);
   const signIn = async () => {
@@ -4566,10 +4692,11 @@ const monthlyCourseNames = uniqueCourseNames([
     (assignments ?? []).forEach((row, index) => {
       const date = String(row.work_date).slice(0, 10);
       const rawArea = String(row.area ?? "").replace("営業所", "");
-      if (rawArea !== "松阪" && rawArea !== "伊勢" && rawArea !== "伊賀") return;
+      if (!rawArea) return;
       const region = rawArea as Region;
 
-      if (!loaded[date]) loaded[date] = { 松阪: [], 伊勢: [], 伊賀: [] };
+      if (!loaded[date]) loaded[date] = emptyOfficeCourses(allRegions);
+      loaded[date][region] ??= [];
 
       const nextCourse: Course = {
         ...createCourse(Date.now() + index, String(row.course ?? "")),
@@ -4663,6 +4790,17 @@ const monthlyCourseNames = uniqueCourseNames([
       (_, index) => `${autoMonth}-${String(index + 1).padStart(2, "0")}`,
     );
     const workedDates = new Map<string, Set<string>>();
+    if (!previousMonthSafety || previousMonthSafety.month !== autoMonth) {
+      issues.push("前月末6日間の勤務を確認中です。確認完了後に公開してください。");
+    } else {
+      Object.entries(previousMonthSafety.worked).forEach(([date, names]) => {
+        names.forEach((name) => {
+          const dates = workedDates.get(name) ?? new Set<string>();
+          dates.add(date);
+          workedDates.set(name, dates);
+        });
+      });
+    }
 
     const findActualCourse = (
       dayCourses: Course[],
@@ -4707,7 +4845,7 @@ const monthlyCourseNames = uniqueCourseNames([
       const dayShift = shiftsByDate[date];
       const seen = new Map<string, string>();
 
-      (["松阪", "伊勢", "伊賀"] as Region[]).forEach((region) => {
+      allRegions.forEach((region) => {
         const dayCourses = dayShift?.[region] ?? [];
         const requiredCourseNames = requiredCoursesForSavedDay(
           date, region, coursePreset,
@@ -4716,6 +4854,7 @@ const monthlyCourseNames = uniqueCourseNames([
 
         requiredCourseNames.forEach((requiredCourseName) => {
           const course = findActualCourse(dayCourses, requiredCourseName, region);
+          if (course && isNonOperatingCourse(course)) return;
           if (!course || !course.driver || course.status === "未配車") {
             issues.push(
               `${date} ${region} ${requiredCourseName}：未配置${
@@ -4744,7 +4883,10 @@ const monthlyCourseNames = uniqueCourseNames([
 
     workedDates.forEach((dates, driverKey) => {
       let streak = 0;
-      monthDates.forEach((date) => {
+      const previousSix = Array.from({ length: 6 }, (_, index) =>
+        formatDateKey(new Date(checkYear, checkMonth - 1, index - 5)),
+      );
+      [...previousSix, ...monthDates].forEach((date) => {
         streak = dates.has(date) ? streak + 1 : 0;
         if (streak === 7) {
           const displayName =
@@ -4763,6 +4905,7 @@ const monthlyCourseNames = uniqueCourseNames([
     dailyCourseOverrides,
     shiftsByDate,
     standbyDrivers,
+    previousMonthSafety,
   ]);
 
   const saveCloudMonth = async (publish: boolean) => {
@@ -4948,21 +5091,18 @@ const monthlyCourseNames = uniqueCourseNames([
       reserve: boolean;
     };
 
-    const regions: Region[] = ["松阪", "伊勢", "伊賀"];
+    const regions: Region[] = allRegions;
     const normalize = (value: string) => value.replace(/[\s　]/g, "");
 
     const rows = new Map<string, BalanceRow>();
 
     getUniqueDrivers().forEach((driver: DriverItem) => {
       const rawMain = driver.mainArea ?? driver.area.replace("営業所", "");
-      const mainRegion: Region =
-        rawMain === "伊勢" || rawMain === "伊賀" ? rawMain : "松阪";
+      const mainRegion: Region = normalizeRegion(rawMain) ?? allRegions[0] ?? "松阪";
 
-      const before = {
-        松阪: getTargetWorkDays(autoMonth, "松阪", driver.name) ?? 0,
-        伊勢: getTargetWorkDays(autoMonth, "伊勢", driver.name) ?? 0,
-        伊賀: getTargetWorkDays(autoMonth, "伊賀", driver.name) ?? 0,
-      };
+      const before: Record<Region, number> = Object.fromEntries(
+        regions.map((region) => [region, getTargetWorkDays(autoMonth, region, driver.name) ?? 0]),
+      );
 
       rows.set(normalize(driver.name), {
         name: driver.name,
@@ -4982,7 +5122,7 @@ const monthlyCourseNames = uniqueCourseNames([
       .filter((issue) => issue.includes("未配置"))
       .forEach((issue) => {
         const match = issue.match(
-          /^(\d{4}-\d{2}-\d{2})\s+(松阪|伊勢|伊賀)\s+(.+?)：(.*未配置.*)$/,
+          /^(\d{4}-\d{2}-\d{2})\s+(\S+)\s+(.+?)：(.*未配置.*)$/,
         );
         if (!match) return;
 
@@ -5083,6 +5223,8 @@ const monthlyCourseNames = uniqueCourseNames([
     })
     .sort((a, b) => a.name.localeCompare(b.name, "ja"));
   const [driverCalendarSearch, setDriverCalendarSearch] = useState("");
+  const [monthlyDriverSearch, setMonthlyDriverSearch] = useState("");
+  const normalizedMonthlySearch = normalizeDriverName(monthlyDriverSearch).toLowerCase();
 
   const calendarDrivers = driversForTargetRegion(activeTab)
   .filter((driver) =>
@@ -5508,7 +5650,7 @@ const monthlyCourseNames = uniqueCourseNames([
                 コース名・固定休・固定担当者を変更できます。設定は次回の自動作成から反映されます。
               </p>
               <div className="mt-4 flex flex-wrap gap-2">
-                {(["松阪", "伊勢", "伊賀"] as Region[]).map((region) => (
+                {allRegions.map((region) => (
                   <button
                     key={region}
                     type="button"
@@ -5960,7 +6102,7 @@ const monthlyCourseNames = uniqueCourseNames([
             </details>
 
             <div className="mt-5 flex flex-wrap gap-2">
-              {(["松阪", "伊勢", "伊賀"] as Region[]).map((tab) => (
+              {allRegions.map((tab) => (
                 <button
                   key={tab}
                   type="button"
@@ -6145,13 +6287,14 @@ const monthlyCourseNames = uniqueCourseNames([
                       <td className="px-2 py-2 font-medium">{course.course}</td>
                       <td className="px-2 py-2">
                         <select
-                          value={course.driver}
+                          value={courseSelectValue(course)}
                           onChange={(event) =>
                             changeCourseDriver(course.id, event.target.value)
                           }
                           className="min-w-36 rounded-lg border border-white/10 bg-slate-800 px-2 py-1.5 text-slate-100"
                         >
                           <option value="">未割当</option>
+                          <option value={NON_OPERATING_VALUE}>非稼働</option>
                           {course.driver && (
                             <option value={course.driver}>
                               {course.driver}
@@ -6190,7 +6333,7 @@ const monthlyCourseNames = uniqueCourseNames([
         : "bg-blue-500/20 text-blue-300"
     }`}
   >
-    {course.memo === "手動変更" ? "手動" : "自動"}
+    {isNonOperatingCourse(course) ? "非稼働" : course.memo === "手動変更" ? "手動" : "自動"}
   </span>
 </td>
                       <td className="px-2 py-2">
@@ -6231,6 +6374,36 @@ const monthlyCourseNames = uniqueCourseNames([
     {!Object.keys(shiftsByDate).some((date) => date.startsWith(`${autoMonth}-`)) && (
       <p className="mt-2 text-sm text-amber-200">{autoMonth}の保存済みシフトはありません。</p>
     )}
+    <div className="mt-4 flex flex-wrap items-center gap-3">
+      <label htmlFor="monthly-driver-search" className="text-sm font-semibold text-slate-300">名前検索</label>
+      <input
+        id="monthly-driver-search"
+        type="search"
+        value={monthlyDriverSearch}
+        onChange={(event) => setMonthlyDriverSearch(event.target.value)}
+        placeholder="名前を入力すると配置が金色に光ります"
+        className="w-full max-w-sm rounded-lg border border-amber-400/40 bg-slate-800 px-3 py-2 text-white placeholder:text-slate-400"
+      />
+      {normalizedMonthlySearch && <span className="text-sm text-amber-300">全営業所の対象者を強調中</span>}
+    </div>
+    <div className="mt-4 flex flex-wrap items-center gap-2" aria-label="月間シフト表の営業所切替">
+      <span className="mr-1 text-sm font-semibold text-slate-300">営業所</span>
+      {allRegions.map((region) => (
+        <button
+          key={region}
+          type="button"
+          onClick={() => setMonthlyRegion(region)}
+          aria-pressed={monthlyRegion === region}
+          className={`rounded-lg px-5 py-2 text-sm font-bold ${
+            monthlyRegion === region
+              ? "bg-blue-600 text-white"
+              : "border border-white/10 bg-slate-900 text-slate-300 hover:bg-slate-800"
+          }`}
+        >
+          {region}
+        </button>
+      ))}
+    </div>
     <div className="mt-4 flex flex-wrap gap-2">
   {weekLabels.map((label, index) => (
     <button
@@ -6288,12 +6461,12 @@ const monthlyCourseNames = uniqueCourseNames([
               {displayedDateKeys.map((dateKey) => {
 const effectiveCourseNames = resolveCourseNamesForDate(
   dateKey,
-  activeTab,
+  monthlyRegion,
   coursePreset,
-  dailyCourseOverrides[dateKey]?.[activeTab],
+  dailyCourseOverrides[dateKey]?.[monthlyRegion],
   courseSettings,
 );                const baseName = normalizeCourseName(courseName);
-                const dayCourses = shiftsByDate[dateKey]?.[activeTab] ?? [];
+                const dayCourses = shiftsByDate[dateKey]?.[monthlyRegion] ?? [];
 
                 // 通常は同じ基本コースを表示。
                 // 結合コースは別行を作らず、先頭側の基本行に表示する。
@@ -6302,13 +6475,13 @@ const effectiveCourseNames = resolveCourseNamesForDate(
                   const mergedName = normalizeCourseName(item.course);
                   if (sameCourseName(item.course, courseName)) return true;
 
-                  if (activeTab === "松阪") {
+                  if (monthlyRegion === "松阪") {
                     if (baseName === "A" && mergedName === "AB") return true;
                     if (baseName === "B" && mergedName === "BC") return true;
                     if (baseName === "C" && mergedName === "CD") return true;
                   }
 
-                  if (activeTab === "伊勢") {
+                  if (monthlyRegion === "伊勢") {
                     if (baseName === "神久" && mergedName === "神久・朝熊")
                       return true;
                     if (baseName === "御薗" && mergedName === "御薗・高向")
@@ -6331,10 +6504,21 @@ const effectiveCourseNames = resolveCourseNamesForDate(
       : null
   );
 
+                const matchesSearch = Boolean(
+                  normalizedMonthlySearch && course?.driver &&
+                  normalizeDriverName(course.driver).toLowerCase().includes(normalizedMonthlySearch)
+                );
+                // 検索欄とは完全に独立して「未割当」を常時シルバー発光。
+                // 実在するコースで、選択値が空（未割当）の場合だけ対象。
+                // 非稼働は専用の選択値なので対象外。担当者を選べば即座に消える。
+                const isUnassigned = Boolean(
+                  course && courseSelectValue(course) === "" &&
+                  !isNonOperatingCourse(course)
+                );
                 return (
                   <td
                     key={`${dateKey}-${courseName}`}
-                    className="border border-white/10 p-2"
+                    className={`border p-2 ${matchesSearch ? "border-amber-300 bg-amber-400/25 shadow-[inset_0_0_24px_rgba(251,191,36,0.6)]" : isUnassigned ? "border-slate-200 bg-slate-200/20 shadow-[inset_0_0_24px_rgba(226,232,240,0.5),0_0_14px_rgba(203,213,225,0.5)]" : "border-white/10"}`}
                   >
                     {course ? (
                       <div>
@@ -6342,18 +6526,19 @@ const effectiveCourseNames = resolveCourseNamesForDate(
                         <div className="mb-1 text-xs text-cyan-300">{course.course}</div>
                       )}
                       <select
-                        value={course.driver}
+                        value={courseSelectValue(course)}
                         onChange={(event) =>
                           changeMonthlyCourseDriver(
                             dateKey,
-                            activeTab,
+                            monthlyRegion,
                             course.id,
                             event.target.value,
                           )
                         }
-                        className="w-32 rounded-lg border border-white/10 bg-slate-800 px-2 py-1.5 text-slate-100"
+                        className={`w-32 rounded-lg border px-2 py-1.5 ${matchesSearch ? "border-amber-300 bg-amber-400 font-bold text-slate-950 shadow-[0_0_14px_rgba(251,191,36,0.9)]" : isUnassigned ? "border-slate-200 bg-gradient-to-b from-slate-200 via-slate-300 to-slate-400 font-bold text-slate-950 shadow-[0_0_14px_rgba(226,232,240,0.8)]" : "border-white/10 bg-slate-800 text-slate-100"}`}
                       >
                         <option value="">未割当</option>
+                          <option value={NON_OPERATING_VALUE}>非稼働</option>
 
                         {course.driver && (
                           <option value={course.driver}>
@@ -6366,7 +6551,7 @@ const effectiveCourseNames = resolveCourseNamesForDate(
                           .filter(
                             (driver) =>
                               driver.area.replace("営業所", "") ===
-                              activeTab,
+                              monthlyRegion,
                           )
                           .map((driver) => (
                             <option

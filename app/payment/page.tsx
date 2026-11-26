@@ -53,6 +53,14 @@ export default function PaymentPage() {
   const [companyStatements, setCompanyStatements] = useState<CompanyStatement[]>([]);
   const [companyStatementsLoading, setCompanyStatementsLoading] = useState(true);
   const [companyChangingId, setCompanyChangingId] = useState<string | null>(null);
+  const [companySearch, setCompanySearch] = useState("");
+  const [companyMonthFilter, setCompanyMonthFilter] = useState("all");
+  const [companyStatusFilter, setCompanyStatusFilter] = useState("all");
+  const [companyPage, setCompanyPage] = useState(1);
+  const [selectedCompanyIds, setSelectedCompanyIds] = useState<string[]>([]);
+  const [companyBulkUpdating, setCompanyBulkUpdating] = useState(false);
+  const [companyDeletingId, setCompanyDeletingId] = useState<string | null>(null);
+
   const [companyName, setCompanyName] = useState("");
   const [representativeName, setRepresentativeName] = useState("");
   const [companyLoading, setCompanyLoading] = useState(false);
@@ -101,6 +109,22 @@ export default function PaymentPage() {
   const selectedVisibleCount = filteredIds.filter((id) => selectedStatementIds.includes(id)).length;
   const allFilteredSelected = filteredIds.length > 0 && selectedVisibleCount === filteredIds.length;
   const selectedCount = selectedStatementIds.length;
+
+  const companyMonths = useMemo(() => [...new Set(companyStatements.map(s => s.target_month))].sort().reverse(), [companyStatements]);
+  const filteredCompanyStatements = useMemo(() => companyStatements.filter(s => {
+    const company = companies.find(c => c.id === s.company_id);
+    return (companyMonthFilter === "all" || s.target_month === companyMonthFilter) &&
+      (companyStatusFilter === "all" || (companyStatusFilter === "published" ? s.is_published : !s.is_published)) &&
+      normalizeName(company?.company_name ?? "").includes(normalizeName(companySearch));
+  }).sort((a, b) => b.target_month.localeCompare(a.target_month) ||
+    (companies.find(c => c.id === a.company_id)?.company_name ?? "").localeCompare(companies.find(c => c.id === b.company_id)?.company_name ?? "", "ja")),
+    [companyStatements, companies, companyMonthFilter, companyStatusFilter, companySearch]);
+  const companyFilteredIds = filteredCompanyStatements.map(s => s.id);
+  const allCompaniesSelected = companyFilteredIds.length > 0 && companyFilteredIds.every(id => selectedCompanyIds.includes(id));
+  const companyTotalPages = Math.max(1, Math.ceil(filteredCompanyStatements.length / PAGE_SIZE));
+  const companyCurrentPage = Math.min(companyPage, companyTotalPages);
+  const visibleCompanyStatements = filteredCompanyStatements.slice((companyCurrentPage - 1) * PAGE_SIZE, companyCurrentPage * PAGE_SIZE);
+
 
 
   const getToken = useCallback(async () => {
@@ -264,6 +288,77 @@ export default function PaymentPage() {
       setCompanyPdfMessage(error instanceof Error ? error.message : "公開状態を変更できませんでした。");
     } finally {
       setCompanyChangingId(null);
+    }
+  }
+
+  function prepareCompanyReplacement(statement: CompanyStatement) {
+    const company = companies.find(c => c.id === statement.company_id);
+    setCompanyPdfId(statement.company_id);
+    setCompanyPdfMonth(statement.target_month);
+    setCompanyPdfFile(null);
+    const input = document.getElementById("company-payment-pdf") as HTMLInputElement | null;
+    if (input) input.value = "";
+    setCompanyPdfError(false);
+    setCompanyPdfMessage(`${company?.company_name ?? "協力会社"}・${monthLabel(statement.target_month)}の差し替えです。PDFを選択して登録してください。登録後は非公開になります。`);
+    document.getElementById("company-payment-upload")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function bulkSetCompanyPublished(nextPublished: boolean) {
+    const selected = companyStatements.filter(s => selectedCompanyIds.includes(s.id));
+    const targets = selected.filter(s => s.is_published !== nextPublished);
+    if (!selected.length) { setCompanyPdfError(true); setCompanyPdfMessage("明細を選択してください。"); return; }
+    if (!targets.length) { setCompanyPdfError(false); setCompanyPdfMessage("選択した明細はすでに変更後の状態です。"); return; }
+    if (!window.confirm(`選択した${selected.length}件のうち${targets.length}件を${nextPublished ? "公開" : "非公開"}にしますか？`)) return;
+    setCompanyBulkUpdating(true);
+    setCompanyPdfMessage("");
+    setCompanyPdfError(false);
+    let completed = 0;
+    try {
+      const token = await getToken();
+      for (const statement of targets) {
+        const response = await fetch("/api/payment/company-statements", {
+          method: "PATCH",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ id: statement.id, isPublished: nextPublished }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) throw new Error(result.error || "公開状態の変更に失敗しました。");
+        completed++;
+      }
+      setSelectedCompanyIds([]);
+      setCompanyPdfMessage(`${completed}件を${nextPublished ? "公開" : "非公開"}に変更しました。`);
+    } catch (error) {
+      setCompanyPdfError(true);
+      setCompanyPdfMessage(`${completed}件変更後に停止しました。${error instanceof Error ? error.message : "処理に失敗しました。"}`);
+    } finally {
+      await loadCompanyStatements();
+      setCompanyBulkUpdating(false);
+    }
+  }
+
+  async function deleteCompanyStatement(statement: CompanyStatement) {
+    const company = companies.find(c => c.id === statement.company_id);
+    if (!window.confirm(`${company?.company_name ?? "協力会社"}・${monthLabel(statement.target_month)}の明細を削除しますか？\n削除後は元に戻せません。`)) return;
+    setCompanyDeletingId(statement.id);
+    setCompanyPdfError(false);
+    setCompanyPdfMessage("");
+    try {
+      const token = await getToken();
+      const response = await fetch("/api/payment/company-statements", {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ id: statement.id }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) throw new Error(result.error || "削除APIが未対応の可能性があります。");
+      setSelectedCompanyIds(ids => ids.filter(id => id !== statement.id));
+      setCompanyPdfMessage("協力会社の明細を削除しました。");
+      await loadCompanyStatements();
+    } catch (error) {
+      setCompanyPdfError(true);
+      setCompanyPdfMessage(error instanceof Error ? error.message : "削除に失敗しました。");
+    } finally {
+      setCompanyDeletingId(null);
     }
   }
 
@@ -912,9 +1007,9 @@ export default function PaymentPage() {
                   {companyMessage}
                 </p>
               )}
-              <p className="mt-4 text-sm text-slate-500">代表者の既存PINによる会社明細の閲覧機能は、別途追加します。</p>
+              <p className="mt-4 text-sm text-slate-500">代表者は登録済みのPINで会社明細を閲覧できます。</p>
             </section>
-            <section className="rounded-2xl bg-white p-6 shadow-sm">
+            <section id="company-payment-upload" className="rounded-2xl bg-white p-6 shadow-sm">
               <h2 className="mb-5 text-xl font-bold">協力会社の支払明細PDF登録</h2>
               <label htmlFor="company-payment-company" className="mb-2 block font-semibold">協力会社</label>
               <select id="company-payment-company" value={companyPdfId} onChange={(e) => setCompanyPdfId(e.target.value)}
@@ -939,31 +1034,76 @@ export default function PaymentPage() {
               <p className="mt-4 text-sm text-amber-700">登録直後は非公開です。同じ会社・同じ月の再登録では古いPDFを置き換え、非公開に戻します。</p>
             </section>
             <section className="rounded-2xl bg-white p-6 shadow-sm">
-              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                <h2 className="text-xl font-bold">登録済み協力会社明細</h2>
-                <button type="button" onClick={() => void loadCompanyStatements()} disabled={companyStatementsLoading}
-                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:opacity-50">一覧を更新</button>
-              </div>
-              {companyStatementsLoading ? <p className="text-slate-500">読み込み中...</p> : companyStatements.length === 0 ?
-                <p className="text-slate-500">登録済みの会社PDFはありません。</p> :
-                <div className="overflow-x-auto rounded-xl border border-slate-200">
-                  <table className="w-full min-w-[540px] text-left text-sm">
-                    <thead className="bg-slate-100"><tr><th className="p-3">協力会社</th><th className="p-3">対象年月</th><th className="p-3">公開状態</th><th className="p-3">操作</th></tr></thead>
-                    <tbody>{companyStatements.map((statement) => (
-                      <tr key={statement.id} className="border-t border-slate-200">
-                        <td className="p-3 font-semibold">{companies.find((company) => company.id === statement.company_id)?.company_name ?? "登録会社不明"}</td>
-                        <td className="whitespace-nowrap p-3">{monthLabel(statement.target_month)}</td>
-                        <td className={`whitespace-nowrap p-3 font-semibold ${statement.is_published ? "text-green-700" : "text-amber-700"}`}>{statement.is_published ? "● 公開中" : "● 非公開"}</td>
-                        <td className="p-3"><button type="button" onClick={() => void toggleCompanyPublished(statement)} disabled={companyChangingId === statement.id}
-                          className={`whitespace-nowrap rounded-lg px-3 py-2 font-bold text-white disabled:opacity-50 ${statement.is_published ? "bg-slate-600" : "bg-blue-600"}`}>
-                          {companyChangingId === statement.id ? "変更中..." : statement.is_published ? "非公開にする" : "公開する"}
-                        </button></td>
-                      </tr>
-                    ))}</tbody>
-                  </table>
-                </div>}
-              <p className="mt-3 text-sm text-slate-500">公開設定は保存されますが、代表者PINによる閲覧機能はまだ未対応です。</p>
-            </section>
+               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                 <h2 className="text-xl font-bold">登録済み協力会社明細</h2>
+                 <button type="button" onClick={() => void loadCompanyStatements()} disabled={companyStatementsLoading}
+                   className="rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:opacity-50">一覧を更新</button>
+               </div>
+               <div className="mb-4 grid gap-3 sm:grid-cols-3">
+                 <label className="block text-sm font-semibold">対象年月
+                   <select value={companyMonthFilter} onChange={e => { setCompanyMonthFilter(e.target.value); setCompanyPage(1); }} className="mt-1 w-full rounded-lg border border-slate-300 bg-white p-2.5">
+                     <option value="all">すべての年月</option>
+                     {companyMonths.map(m => <option key={m} value={m}>{monthLabel(m)}</option>)}
+                   </select>
+                 </label>
+                 <label className="block text-sm font-semibold">協力会社名
+                   <input type="search" value={companySearch} onChange={e => { setCompanySearch(e.target.value); setCompanyPage(1); }} placeholder="会社名で検索" className="mt-1 w-full rounded-lg border border-slate-300 p-2.5" />
+                 </label>
+                 <label className="block text-sm font-semibold">公開状態
+                   <select value={companyStatusFilter} onChange={e => { setCompanyStatusFilter(e.target.value); setCompanyPage(1); }} className="mt-1 w-full rounded-lg border border-slate-300 bg-white p-2.5">
+                     <option value="all">すべて</option><option value="published">公開中</option><option value="unpublished">非公開</option>
+                   </select>
+                 </label>
+               </div>
+               <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600">
+                 <span>検索結果：{filteredCompanyStatements.length}件（全{companyStatements.length}件）</span>
+                 <button type="button" className="rounded-lg border px-3 py-1.5" onClick={() => { setCompanyMonthFilter("all"); setCompanySearch(""); setCompanyStatusFilter("all"); setCompanyPage(1); }}>絞り込み解除</button>
+               </div>
+               <div className="mb-4 rounded-xl border border-blue-100 bg-blue-50 p-4">
+                 <div className="flex flex-wrap items-center gap-3">
+                   <button type="button" disabled={companyBulkUpdating || companyFilteredIds.length === 0} onClick={() => setSelectedCompanyIds(previous => {
+                     const other = previous.filter(id => !companyFilteredIds.includes(id));
+                     return allCompaniesSelected ? other : [...new Set([...previous, ...companyFilteredIds])];
+                   })} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">
+                     {allCompaniesSelected ? "一括選択を解除" : `一括選択（${companyFilteredIds.length}件）`}
+                   </button>
+                   <span className="text-sm font-semibold text-blue-950">選択中：{selectedCompanyIds.length}件</span>
+                   <button type="button" onClick={() => setSelectedCompanyIds([])} disabled={companyBulkUpdating || selectedCompanyIds.length === 0} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">選択解除</button>
+                 </div>
+                 <div className="mt-3 flex flex-wrap gap-2">
+                   <button type="button" onClick={() => void bulkSetCompanyPublished(true)} disabled={companyBulkUpdating || companyChangingId !== null || companyDeletingId !== null || selectedCompanyIds.length === 0} className="rounded-lg bg-blue-700 px-4 py-2 font-bold text-white disabled:opacity-50">{companyBulkUpdating ? "変更中..." : "選択した明細を一括公開"}</button>
+                   <button type="button" onClick={() => void bulkSetCompanyPublished(false)} disabled={companyBulkUpdating || companyChangingId !== null || companyDeletingId !== null || selectedCompanyIds.length === 0} className="rounded-lg bg-slate-700 px-4 py-2 font-bold text-white disabled:opacity-50">{companyBulkUpdating ? "変更中..." : "選択した明細を一括非公開"}</button>
+                 </div>
+                 <p className="mt-2 text-xs text-slate-600">一括選択は絞り込んだ全件（ページをまたぐ分も含む）が対象です。</p>
+               </div>
+               {companyStatementsLoading ? <p className="text-slate-500">読み込み中...</p> : companyStatements.length === 0 ?
+                 <p className="text-slate-500">登録済みの会社PDFはありません。</p> : filteredCompanyStatements.length === 0 ?
+                 <p className="text-slate-500">条件に合う協力会社明細はありません。</p> : <>
+                 <div className="overflow-x-auto rounded-xl border border-slate-200">
+                   <table className="w-full min-w-[640px] text-left text-sm">
+                     <thead className="bg-slate-100"><tr><th className="p-3">選択</th><th className="p-3">協力会社</th><th className="p-3">対象年月</th><th className="p-3">公開状態</th><th className="p-3">操作</th></tr></thead>
+                     <tbody>{visibleCompanyStatements.map(statement => (
+                       <tr key={statement.id} className="border-t border-slate-200">
+                         <td className="p-3"><input type="checkbox" aria-label={`${companies.find(c => c.id === statement.company_id)?.company_name ?? "協力会社"} ${monthLabel(statement.target_month)}を選択`} checked={selectedCompanyIds.includes(statement.id)} disabled={companyBulkUpdating} onChange={e => setSelectedCompanyIds(previous => e.target.checked ? [...new Set([...previous, statement.id])] : previous.filter(id => id !== statement.id))} className="h-5 w-5 accent-blue-700" /></td>
+                         <td className="p-3 font-semibold">{companies.find(c => c.id === statement.company_id)?.company_name ?? "登録会社不明"}</td>
+                         <td className="whitespace-nowrap p-3">{monthLabel(statement.target_month)}</td>
+                         <td className={`whitespace-nowrap p-3 font-semibold ${statement.is_published ? "text-green-700" : "text-amber-700"}`}>{statement.is_published ? "● 公開中" : "● 非公開"}</td>
+                         <td className="p-3"><div className="flex flex-wrap gap-2">
+                           <button type="button" onClick={() => void toggleCompanyPublished(statement)} disabled={companyBulkUpdating || companyChangingId === statement.id || companyDeletingId === statement.id} className={`whitespace-nowrap rounded-lg px-3 py-2 font-bold text-white disabled:opacity-50 ${statement.is_published ? "bg-slate-600" : "bg-blue-600"}`}>{companyChangingId === statement.id ? "変更中..." : statement.is_published ? "非公開にする" : "公開する"}</button>
+                           <button type="button" onClick={() => prepareCompanyReplacement(statement)} disabled={companyBulkUpdating || companyPdfUploading || companyDeletingId === statement.id} className="whitespace-nowrap rounded-lg border border-blue-600 px-3 py-2 font-bold text-blue-700 disabled:opacity-50">PDF差し替え</button>
+                           <button type="button" onClick={() => void deleteCompanyStatement(statement)} disabled={companyBulkUpdating || companyDeletingId === statement.id || companyChangingId === statement.id} className="whitespace-nowrap rounded-lg border border-red-300 px-3 py-2 font-bold text-red-700 disabled:opacity-50">{companyDeletingId === statement.id ? "削除中..." : "削除"}</button>
+                         </div></td>
+                       </tr>
+                     ))}</tbody>
+                   </table>
+                 </div>
+                 {companyTotalPages > 1 && <div className="mt-4 flex items-center justify-center gap-4">
+                   <button type="button" disabled={companyCurrentPage === 1} onClick={() => setCompanyPage(p => Math.max(1, p - 1))} className="rounded-lg border px-4 py-2 disabled:opacity-40">前へ</button>
+                   <span className="text-sm">{companyCurrentPage} / {companyTotalPages} ページ</span>
+                   <button type="button" disabled={companyCurrentPage === companyTotalPages} onClick={() => setCompanyPage(p => Math.min(companyTotalPages, p + 1))} className="rounded-lg border px-4 py-2 disabled:opacity-40">次へ</button>
+                 </div>}
+               </>}
+             </section>
             <section className="rounded-2xl bg-white p-6 shadow-sm">
               <div className="mb-5 flex items-center justify-between gap-2">
                 <h2 className="text-xl font-bold">登録済み協力会社</h2>

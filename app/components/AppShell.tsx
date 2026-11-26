@@ -10,12 +10,14 @@ const supabase = maybeSupabase!;
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const isDriverSharePage =
-    pathname === "/shift/share" ||
-    pathname.startsWith("/shift/share/") ||
-    pathname === "/payment/share" ||
-    pathname.startsWith("/payment/share/");
-
+const isDriverSharePage =
+  pathname === "/shift/share" ||
+  pathname.startsWith("/shift/share/") ||
+  pathname === "/payment/share" ||
+  pathname.startsWith("/payment/share/") ||
+  pathname === "/handover/share" ||
+  pathname.startsWith("/handover/share/");
+  
   const [session, setSession] = useState<Session | null>(null);
   const [checking, setChecking] = useState(true);
   const [email, setEmail] = useState("");
